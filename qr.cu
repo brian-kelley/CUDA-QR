@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cmath>
+#include <cstdlib>
 
 //Overall algorithm:
 //For each panel column (SERIAL):
@@ -32,29 +33,14 @@ __global__ void mmqr(Scalar* mat, int m, int n)
     for(int pr = m - R; pr >= pc; pr -= (R-C))
     {
       //load panel into shared
-
     }
   }
 }
 
-//left and right are RxC arrays
-//left is the current panel being eliminated
-//right is a panel in the trailing matrix
-__device__ void applyPanel()
-{
-}
-
-__global__ void add(int* a, int* b, int* c)
-{
-  int i = blockIdx.x;
-  c[i] = a[i] + b[i];
-}
-
 int main()
 {
-  int* a;
-  int* b;
-  int* c;
+  int m = 1024;
+  int n = 256;
   cudaMalloc((void**) &a, R);
   cudaMalloc((void**) &b, R);
   cudaMalloc((void**) &c, R);
