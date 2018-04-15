@@ -1,8 +1,12 @@
-COMPUTE_CAPABILITY=35
+all: device host
 
-all:
-	nvcc -arch=sm_35 qr.cu -o qr.exe
+device:
+	nvcc -arch=sm_35 qr.cu -o qr_device.exe
+
+host:
+	gcc -std=c11 qr.c -o qr_host.exe
 
 clean:
-	rm qr.exe
+	rm qr_device.exe
+	rm qr_host.exe
 
