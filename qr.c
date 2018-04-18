@@ -53,8 +53,22 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         Scalar sign = panel[col][col] < 0 ? -1 : 1;
         Scalar u = panel[col][col] + sign * norm;
         panel[col][col] = -sign * normx;
-        //get the length of w vector (including leading 1)
-        int wlen = R - col;
+        //is the panel at the bottom of A?
+        bool bottomPanel = pr == m - R;
+        //does col 0 of panel cross A's diagonal?
+        bool topPanel = pr <= pc;
+        //(middle panels are both top and bottom)
+        int wstart;
+        int wend;
+        if(topPanel)
+          wstart = pr + (R-C) + col;
+        else
+          wstart = pr + R;
+        if(bottomPanel)
+          wend = pr + col;
+        else
+          wend = pc + col;
+        int wlen = wend - wstart;
         Scalar* w = malloc(wlen * sizeof(Scalar));
         //compute entire w explicitly,
         //writing back entries to A
