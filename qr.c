@@ -61,13 +61,13 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         int wstart;
         int wend;
         if(topPanel)
-          wstart = pr + (R-C) + col;
+          wend = pr + (R-C) + col;
         else
-          wstart = pr + R;
+          wend = R;
         if(bottomPanel)
-          wend = pr + col;
+          wstart = col;
         else
-          wend = pc + col;
+          wstart = -pr + pc + col;
         int wlen = wend - wstart;
         Scalar* w = malloc(wlen * sizeof(Scalar));
         //compute entire w explicitly,
