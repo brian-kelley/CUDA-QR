@@ -71,32 +71,50 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         int wlen = wend - wstart;
         Scalar* w = malloc(wlen * sizeof(Scalar));
         //compute entire w explicitly,
-        //writing back entries to A
-        for(int i = col; i < C; i++)
+        //then write back nontrivial entries to the panel
+        w[0] = 1;
+        for(int i = wstart + 1; i < wend; i++)
         {
-          w[i] = panel[col][i] / u;
-          if(i >= col + 1)
-            panel[col][i] = w[i];
+          panel[col][i] /= u;
+          w[i - wstart] = panel[col][i];
         }
         panelTau[col] = sign * u / norm;
         //apply reflector in col to remaining columns in panel
         for(int applyCol = col; applyCol < C; applyCol++)
         {
-          //put updated column in panelCol
-          Scalar* panelCol = malloc(wlen * sizeof(Scalar));
-          for(int applyRow = 0; applyRow < wlen; applyRow++)
+          for(int applyRow = wstart; applyRow < wend; applyRow++)
           {
-            float val = 0;
+            int windex = applyRow - wstart;
+            float val = panel[applyCol][applyRow];
             for(int i = 0; i < wlen; i++)
             {
-              val += panelTau[applyCol] * 
+              val -= panelTau[applyCol] * w[windex] * w[i] * panel[applyCol][applyRow];
             }
-            panelCol[
+            panel[applyCol][applyRow] = val;
           }
-          free(panelCol);
         }
       }
-      Scalar norm = 0;
+      //panel and panelTau are now both fully computed
+      //write back panel to A
+      for(int col = 0; col < C; col++)
+      {
+        memcpy(&mat[pr + pc * m], &panel[col][0], sizeof(Scalar) * R);
+      }
+      //compute W explicitly, so that trailing updates can be a series of
+      //mat-vecs in shared memory
+      //
+      //the Y matrix is read from the subdiagonal part of the panel that was
+      //just computed
+      //
+      //see Kerr, Campbell, Richards paper for this (Algorithm 2)
+      Scalar W[C][R];
+      for(int tcol = pc + C; tcol < N; tcol++)
+      {
+        for(int trow = pr; trow < pr + R; trow++)
+        {
+        }
+      }
+      //update each trailing column (pr:pr+R, pc+C:N)
     }
   }
 }
