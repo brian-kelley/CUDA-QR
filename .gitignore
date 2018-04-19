@@ -1,4 +1,5 @@
-qr.exe
+*.exe
+*.exe.*
 .DS_Store
 .*.swo
 .*.swp

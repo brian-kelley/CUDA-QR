@@ -3,25 +3,27 @@
 #include <stdio.h>
 #include <assert.h>
 
-//Overall algorithm:
-//For each panel column (SERIAL):
-//  For each dense panel from the bottom up (SERIAL):
-//    Load panel into shared
-//    For each panel column (SERIAL):
-//      compute and store hh reflector and beta
-//      apply reflectors to trailing columns of panel (possibly parallel)
-//      reflectors are written back to lower part of panel,
-//    For each trailing panel (PARALLEL):
-//      apply the reflections to trailing panel, replacing values
-
 //Scalar type and panel size (RxC)
 //Scalar may be either float or double
 //(2RC + C) * sizeof(Scalar) must fit in 48 KiB
 #define Scalar float
-#define R 128
-#define C 16
+#define R 16
+#define C 4
 
-//This file is a working prototype of the algorithm in plain C (no CUDA)
+//print a column-major matrix row-by-row (for debugging)
+void printMat(Scalar* mat, int m, int n)
+{
+  printf("Matrix %d x %d, row by row:\n", m, n);
+  for(int i = 0; i < m; i++)
+  {
+    for(int j = 0; j < n; j++)
+    {
+      printf("%f ", mat[j * m + i]);
+    }
+    putchar('\n');
+  }
+  putchar('\n');
+}
 
 //mat should be column-major
 void mmqr(Scalar* mat, Scalar* tau, int m, int n)
@@ -85,7 +87,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
           for(int applyRow = wstart; applyRow < wend; applyRow++)
           {
             int windex = applyRow - wstart;
-            float val = panel[applyCol][applyRow];
+            Scalar val = panel[applyCol][applyRow];
             for(int i = 0; i < wlen; i++)
             {
               val -= panelTau[applyCol] * w[windex] * w[i] * panel[applyCol][applyRow];
@@ -93,6 +95,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
             panel[applyCol][applyRow] = val;
           }
         }
+        free(w);
       }
       //panel and panelTau are now both fully computed
       //write back panel to A
@@ -100,6 +103,9 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       {
         memcpy(&mat[pr + pc * m], &panel[col][0], sizeof(Scalar) * R);
       }
+      /*
+       * TODO: use real blocked algo
+       * 
       //compute W explicitly, so that trailing updates can be a series of
       //mat-vecs in shared memory
       //
@@ -108,31 +114,51 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       //
       //see Kerr, Campbell, Richards paper for this (Algorithm 2)
       Scalar W[C][R];
-      for(int tcol = pc + C; tcol < N; tcol++)
+      //first column of W is special: just w
+      //compute each column of W (j) which corresponds to tcol in actual matrix
+      for(int j = 1; j < C; j++)
       {
+        int tcol = pc + j;
         for(int trow = pr; trow < pr + R; trow++)
         {
         }
       }
-      //update each trailing column (pr:pr+R, pc+C:N)
+      */
+      //update each trailing column (pr:pr+R, pc+C:N):
+      //multiply each column by (I - tau * ww')
+      Scalar w[R];
+      for(int applyCol = pc + C; applyCol < n; applyCol++)
+      {
+        for(int applyRow = pr; applyRow < pr + R; applyRow++)
+        {
+          Scalar val = mat[applyCol][applyRow];
+          for(int i = 0; i < wlen; i++)
+          {
+            Scalar wwVal;
+            val -= panelTau[applyCol] * w[windex] * w[i] * panel[applyCol][applyRow];
+          }
+          panel[applyCol][applyRow] = val;
+        }
+      }
     }
   }
 }
 
 int main()
 {
-  int m = 1024;
-  int n = 256;
-  assert(m < n);
+  int m = R;
+  int n = C;
+  assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* tau = malloc(n * sizeof(Scalar));
   srand(12);
   //initialize A randomly
   for(int i = 0; i < m * n; i++)
   {
-    A[i] = float(rand()) / RAND_MAX;
+    A[i] = (Scalar) rand() / RAND_MAX;
   }
-  mmqr(A, tau, m, n);
+  printMat(A, m, n);
+  //mmqr(A, tau, m, n);
   return 0;
 }
 
