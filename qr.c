@@ -43,6 +43,9 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       {
         memcpy(&panel[col][0], &mat[pr + pc * m], sizeof(Scalar) * R);
       }
+      //W matrix (for applying whole panel of HH reflectors at once)
+      //should be in shared and is updated as each reflector is determined
+      Scalar W[C][R];
       //for each column, compute HH reflectors
       for(int col = 0; col < C; col++)
       {
@@ -60,18 +63,18 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         //does col 0 of panel cross A's diagonal?
         bool topPanel = pr <= pc;
         //(middle panels are both top and bottom)
-        int wstart;
-        int wend;
+        int vstart;
+        int vend;
         if(topPanel)
-          wend = pr + (R-C) + col;
+          vend = pr + (R-C) + col;
         else
-          wend = R;
+          vend = R;
         if(bottomPanel)
-          wstart = col;
+          vstart = col;
         else
-          wstart = -pr + pc + col;
-        int wlen = wend - wstart;
-        Scalar* w = malloc(wlen * sizeof(Scalar));
+          vstart = -pr + pc + col;
+        int vlen = vend - vstart;
+        Scalar* v = malloc(vlen * sizeof(Scalar));
         //compute entire w explicitly,
         //then write back nontrivial entries to the panel
         w[0] = 1;
@@ -80,22 +83,24 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
           panel[col][i] /= u;
           w[i - wstart] = panel[col][i];
         }
+        //w is now fully computed
+        //update W
         panelTau[col] = sign * u / norm;
         //apply reflector in col to remaining columns in panel
         for(int applyCol = col; applyCol < C; applyCol++)
         {
-          for(int applyRow = wstart; applyRow < wend; applyRow++)
+          for(int applyRow = vstart; applyRow < vend; applyRow++)
           {
-            int windex = applyRow - wstart;
+            int vindex = applyRow - vstart;
             Scalar val = panel[applyCol][applyRow];
-            for(int i = 0; i < wlen; i++)
+            for(int i = 0; i < vlen; i++)
             {
-              val -= panelTau[applyCol] * w[windex] * w[i] * panel[applyCol][applyRow];
+              val -= panelTau[applyCol] * v[vindex] * v[i] * panel[applyCol][applyRow];
             }
             panel[applyCol][applyRow] = val;
           }
         }
-        free(w);
+        free(v);
       }
       //panel and panelTau are now both fully computed
       //write back panel to A
@@ -103,9 +108,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       {
         memcpy(&mat[pr + pc * m], &panel[col][0], sizeof(Scalar) * R);
       }
-      /*
-       * TODO: use real blocked algo
-       * 
       //compute W explicitly, so that trailing updates can be a series of
       //mat-vecs in shared memory
       //
@@ -123,7 +125,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         {
         }
       }
-      */
       //update each trailing column (pr:pr+R, pc+C:N):
       //multiply each column by (I - tau * ww')
       Scalar w[R];
