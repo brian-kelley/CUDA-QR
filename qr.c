@@ -43,18 +43,27 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       {
         memcpy(&panel[col][0], &mat[pr + pc * m], sizeof(Scalar) * R);
       }
-      //W matrix (for applying whole panel of HH reflectors at once)
+      //see Kerr/Campbell/Richards paper for blocked Householder description
+      //
+      //The W matrix (for applying whole panel of HH reflectors at once)
       //should be in shared and is updated as each reflector is determined
+      //
+      //the Y matrix is read from the subdiagonal part of the panel that was
+      //just computed (doesn't need separate explicit storage)
       Scalar W[C][R];
+      for(int i = 0; i < C; i++)
+        for(int j = 0; j < R; j++)
+          W[i][j] = 0;
+      //update each trailing column (pr:pr+R, pc+C:N):
       //for each column, compute HH reflectors
       for(int col = 0; col < C; col++)
       {
-        Scalar norm = 0;
+        Scalar innerProd = 0;
         for(int row = col; row < C; row++)
         {
-          norm += panel[col][row] * panel[col][row];
+          innerProd += panel[col][row] * panel[col][row];
         }
-        norm = sqrt(norm);
+        norm = sqrt(innerProd);
         Scalar sign = panel[col][col] < 0 ? -1 : 1;
         Scalar u = panel[col][col] + sign * norm;
         panel[col][col] = -sign * normx;
@@ -77,14 +86,29 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         Scalar* v = malloc(vlen * sizeof(Scalar));
         //compute entire w explicitly,
         //then write back nontrivial entries to the panel
-        w[0] = 1;
-        for(int i = wstart + 1; i < wend; i++)
+        v[0] = 1;
+        for(int i = vstart + 1; i < vend; i++)
         {
           panel[col][i] /= u;
-          w[i - wstart] = panel[col][i];
+          v[i - vstart] = panel[col][i];
         }
-        //w is now fully computed
-        //update W
+        //v is now fully computed
+        //update W matrix
+        //column 0 of W is special: can save most of the computation
+        if(col == 0)
+        {
+          for(int i = wstart; i < wend; i++)
+          {
+            W[0][i] = (-2 / innerProd) * v[i - wstart];
+          }
+        }
+        else
+        {
+          for(int i = wstart; i < wend; i++)
+          {
+            W[col][i] = (-2 / innerProd) * v[i - wstart];
+          }
+        }
         panelTau[col] = sign * u / norm;
         //apply reflector in col to remaining columns in panel
         for(int applyCol = col; applyCol < C; applyCol++)
@@ -108,24 +132,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       {
         memcpy(&mat[pr + pc * m], &panel[col][0], sizeof(Scalar) * R);
       }
-      //compute W explicitly, so that trailing updates can be a series of
-      //mat-vecs in shared memory
-      //
-      //the Y matrix is read from the subdiagonal part of the panel that was
-      //just computed
-      //
-      //see Kerr, Campbell, Richards paper for this (Algorithm 2)
-      Scalar W[C][R];
-      //first column of W is special: just w
-      //compute each column of W (j) which corresponds to tcol in actual matrix
-      for(int j = 1; j < C; j++)
-      {
-        int tcol = pc + j;
-        for(int trow = pr; trow < pr + R; trow++)
-        {
-        }
-      }
-      //update each trailing column (pr:pr+R, pc+C:N):
       //multiply each column by (I - tau * ww')
       Scalar w[R];
       for(int applyCol = pc + C; applyCol < n; applyCol++)
@@ -133,10 +139,10 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         for(int applyRow = pr; applyRow < pr + R; applyRow++)
         {
           Scalar val = mat[applyCol][applyRow];
-          for(int i = 0; i < wlen; i++)
+          for(int i = 0; i < vlen; i++)
           {
             Scalar wwVal;
-            val -= panelTau[applyCol] * w[windex] * w[i] * panel[applyCol][applyRow];
+            val -= panelTau[applyCol] * v[windex] * v[i] * panel[applyCol][applyRow];
           }
           panel[applyCol][applyRow] = val;
         }
