@@ -1,10 +1,10 @@
-all: device host
+all: host
 
 device:
 	nvcc -arch=sm_35 qr.cu -o qr_device.exe
 
 host:
-	gcc -g qr.c -o qr_host.exe
+	gcc -Wall -Wshadow -g qr.c -o qr_host.exe -lm
 
 clean:
 	rm qr_device.exe
