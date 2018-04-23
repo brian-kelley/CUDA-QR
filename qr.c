@@ -9,8 +9,8 @@
 //Scalar may be either float or double
 //(2RC + C) * sizeof(Scalar) must fit in 48 KiB
 #define Scalar float
-#define PR 16
-#define PC 4
+#define PR 256
+#define PC 256
 
 void printMat(Scalar* mat, int m, int n);
 void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n);
@@ -42,7 +42,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   {
     //then bottom to top, sliding panel up by R-C each iteration
     //for(int pr = m - PR; pr + PR > pc; pr -= (PR-PC))
-    for(int pr = 0; pr < 1; pr += (PR-PC))
+    for(int pr = 0; pr < 1; pr++)
     {
       printf("Processing panel at col %d, row %d\n", pc, pr);
       //load panel into shared memory, one column at a time
@@ -158,14 +158,14 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         for(int i = 0; i < PR; i++)
         {
           if(i >= vstart && i < vend)
-            z[i] = -beta * v[i];
+            z[i] = -beta * v[i - vstart];
           else
             z[i] = 0;
         }
         for(int i = 0; i < PR; i++)
         {
           //finish computing entry i of z
-          //compute zval as entry i of W * Y^T * v
+          //compute zval as (W * Y^T * v)(i)
           Scalar zval = 0;
           for(int j = 0; j < PR; j++)
           {
@@ -179,7 +179,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
               {
                 wyt += W[k][i] * Y[k][j];
               }
-              zval += wyt * v[j];
+              zval += wyt * v[j - vstart];
             }
           }
           z[i] -= beta * zval;
@@ -264,7 +264,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
             Scalar ywt = 0;
             for(int k = 0; k < PC; k++)
             {
-              ywt += Y[i][k] * W[j][k];
+              ywt += Y[k][i] * W[k][j];
             }
             //multiply that by entry j of A
             newAval += ywt * Acol[j];
@@ -377,7 +377,7 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 int main()
 {
   int m = PR;
-  int n = PC * 2;
+  int n = PC;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* RV = malloc(m * n * sizeof(Scalar));
