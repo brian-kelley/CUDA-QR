@@ -50,10 +50,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       for(int i = 0; i < PC; i++)
       {
         panelTau[i] = 0;
-        for(int j = 0; j < PR; j++)
-        {
-          panel[i][j] = 0;
-        }
       }
       for(int col = 0; col < PC; col++)
       {
@@ -198,20 +194,30 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         */
         panelTau[col] = sign * u / norm;
         //apply reflector in col to remaining columns in panel
-        for(int applyCol = col; applyCol < PC; applyCol++)
+        for(int applyCol = col + 1; applyCol < PC; applyCol++)
         {
+          //Create a copy of the updating column of A which can
+          //persist while each entry is computed
+          Scalar* Acol = malloc(vlen * sizeof(Scalar));
+          for(int i = 0; i < vlen; i++)
+          {
+            Acol[i] = panel[applyCol][i + vstart];
+          }
           for(int applyRow = vstart; applyRow < vend; applyRow++)
           {
             int vindex = applyRow - vstart;
-            Scalar val = panel[applyCol][applyRow];
+            Scalar val = Acol[applyRow];
             for(int i = 0; i < vlen; i++)
             {
-              val -= panelTau[applyCol] * v[vindex] * v[i] * panel[applyCol][applyRow];
+              val -= panelTau[applyCol] * v[vindex] * v[i] * Acol[applyRow];
             }
             panel[applyCol][applyRow] = val;
           }
+          free(Acol);
         }
         free(v);
+        printf("Panel after processing column %d:\n", col);
+        printMat((Scalar*) &panel[0][0], PR, PC);
       }
       //panel, panelTau, W and Y are all fully computed
       //write back panel to A
@@ -225,6 +231,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       //update trailing columns of A: A = (I + YW^T)A
       //the new columns of A can be updated independently (and in parallel)
       //so this loop could be a kernel launch with some A columns given to each SM
+      /*
       for(int applyCol = pc + PC; applyCol < n; applyCol++)
       {
         //The new column, to be copied back into A
@@ -261,6 +268,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
           mat[pr + i + applyCol * m] = newAcol[i];
         }
       }
+      */
       for(int i = 0; i < PC; i++)
       {
         printf("updating tau[%d] value = %f\n", i + pc, panelTau[i]);
@@ -281,9 +289,9 @@ void identity(Scalar* A, int m)
   }
 }
 
-//From the A, tau produced by mmqr,
+//From A and tau array produced by mmqr,
 //explicitly find Q and R matrices
-//Q must be mxm and A,R mxn
+//Q is mxm, A and R are mxn
 //All matrices are column-major
 void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
 {
@@ -322,7 +330,7 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
       //k is row
       for(int k = 0; k < m; k++)
       {
-        H[k + j * m] -= tau[j] * v[k] * v[j];
+        H[k + j * m] -= tau[i] * v[k] * v[j];
       }
     }
     Scalar* prevQ = malloc(m * m * sizeof(Scalar));
@@ -349,9 +357,9 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
       Scalar cval = 0;
       for(int l = 0; l < m; l++)
       {
-        cval += A[j + l * m] * B[l + i * n];
+        cval += A[j + l * k] * B[l + i * m];
       }
-      C[j + i * n] = cval;
+      C[j + i * k] = cval;
     }
   }
 }
@@ -362,17 +370,19 @@ int main()
   int n = PC;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
+  Scalar* RV = malloc(m * n * sizeof(Scalar));
   Scalar* tau = malloc(n * sizeof(Scalar));
   srand(12);
   //initialize A randomly
   for(int i = 0; i < m * n; i++)
   {
     A[i] = (Scalar) rand() / RAND_MAX;
+    RV[i] = A[i];
   }
   printMat(A, m, n);
-  mmqr(A, tau, m, n);
+  mmqr(RV, tau, m, n);
   printf("A raw storage after QR:\n");
-  printMat(A, m, n);
+  printMat(RV, m, n);
   printf("tau values after QR:\n");
   for(int i = 0; i < n; i++)
   {
@@ -381,13 +391,24 @@ int main()
   putchar('\n');
   Scalar* Q = malloc(m * m * sizeof(Scalar));
   Scalar* R = malloc(m * n * sizeof(Scalar));
-  explicitQR(A, tau, Q, R, m, n);
+  explicitQR(RV, tau, Q, R, m, n);
+  printf("Q matrix:\n");
+  printMat(Q, m, m);
+  printf("R matrix:\n");
+  printMat(R, m, n);
   //now compute Q*R explicitly and compare to A
   Scalar* QR = malloc(m * n * sizeof(Scalar));
   dgemm(Q, R, QR, m, m, n);
   printf("QR (should match A):\n");
   printMat(QR, m, n);
+  printf("QR-A (should be 0):\n");
+  Scalar* QRmA = malloc(m * n * sizeof(Scalar));
+  for(int i = 0; i < m * n; i++)
+    QRmA[i] = QR[i] - A[i];
+  printMat(QRmA, m, n);
+  free(QRmA);
   free(QR);
+  free(RV);
   free(R);
   free(Q);
   free(A);
