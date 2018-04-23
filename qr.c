@@ -124,6 +124,8 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         Scalar sign = (panel[col][vstart] < 0) ? -1.0 : 1.0;
         Scalar u = panel[col][vstart] + sign * norm;
         panelTau[col] = sign * u / norm;
+        //beta is from Algorithm 3 of Kerr
+        Scalar beta = 2 / innerProd;
         printf("u is %f\n", u);
         panel[col][vstart] = -sign * norm;
         printf("in col %d of panel, v in rows [%d, %d)\n", col, vstart, vend);
@@ -144,14 +146,13 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         }
         putchar('\n');
         //update W matrix
-        //beta is from Algorithm 3 of Kerr
-        Scalar beta = 2 / innerProd;
         //compute z = -Bv - WY^T * v
         Scalar z[PR];
         for(int i = 0; i < PR; i++)
         {
           if(i >= vstart && i < vend)
-            z[i] = -beta * v[i - vstart];
+            //z[i] = -beta * v[i - vstart];
+            z[i] = -panelTau[col] * v[i - vstart];
           else
             z[i] = 0;
         }
@@ -177,7 +178,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
                 wytvi += wyt * v[j - vstart];
               }
             }
-            z[i] -= beta * wytvi;
+            z[i] -= panelTau[col] * wytvi;
           }
         }
         //z is the next column of W
@@ -243,6 +244,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       //so this loop can be a kernel launch with a few A columns in each block
 
       //TEMPORARY: using the simpler updating scheme to isolate issue
+      /*
       for(int reflector = 0; reflector < PC; reflector++)
       {
         int vstart;
@@ -299,7 +301,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         }
         free(v);
       }
-        /*
+      */
       for(int applyCol = pc + PC; applyCol < n; applyCol++)
       {
         printf("Updating trailing column %d\n", applyCol);
@@ -340,7 +342,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         free(Acol);
         free(newAcol);
       }
-      */
       for(int i = 0; i < PC; i++)
       {
         printf("updating tau[%d] value = %f\n", i + pc, panelTau[i]);
