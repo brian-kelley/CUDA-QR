@@ -49,10 +49,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       //Note that panel is column major
       Scalar (*panel)[PR] = malloc(PC * PR * sizeof(Scalar));
       Scalar* panelTau = malloc(PC * sizeof(Scalar));
-      for(int i = 0; i < PC; i++)
-      {
-        panelTau[i] = 0;
-      }
       for(int col = 0; col < PC; col++)
       {
         for(int row = 0; row < PR; row++)
@@ -285,10 +281,10 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         printf("updating tau[%d] value = %f\n", i + pc, panelTau[i]);
         tau[i + pc] = panelTau[i];
       }
-      free(panel);
-      free(W);
       free(Y);
+      free(W);
       free(panelTau);
+      free(panel);
     }
   }
 }
