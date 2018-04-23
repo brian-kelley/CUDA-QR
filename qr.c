@@ -9,8 +9,8 @@
 //Scalar may be either float or double
 //(2RC + C) * sizeof(Scalar) must fit in 48 KiB
 #define Scalar float
-#define PR 256
-#define PC 256
+#define PR 16
+#define PC 4
 
 void printMat(Scalar* mat, int m, int n);
 void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n);
@@ -47,17 +47,17 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       printf("Processing panel at col %d, row %d\n", pc, pr);
       //load panel into shared memory, one column at a time
       //Note that panel is column major
-      Scalar panel[PC][PR];
-      Scalar panelTau[PC];
+      Scalar (*panel)[PR] = malloc(PC * PR * sizeof(Scalar));
+      Scalar* panelTau = malloc(PC * sizeof(Scalar));
       for(int i = 0; i < PC; i++)
       {
         panelTau[i] = 0;
       }
-      for(int col = pc; col < pc + PC; col++)
+      for(int col = 0; col < PC; col++)
       {
-        for(int row = pr; row < pr + PR; row++)
+        for(int row = 0; row < PR; row++)
         {
-          panel[col][row] = mat[row + col * m];
+          panel[col][row] = mat[(row + pr) + (col + pc) * m];
         }
       }
       printf("Initial panel values:\n");
@@ -69,8 +69,8 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       //
       //TODO: columns of Y matrix are just the reflectors, so an explicit
       //copy of it is unnecessary (in final version, read it from panel subdiagonal)
-      Scalar W[PC][PR];
-      Scalar Y[PC][PR];
+      Scalar (*W)[PR] = malloc(PC * PR * sizeof(Scalar));
+      Scalar (*Y)[PR] = malloc(PC * PR * sizeof(Scalar));
       for(int i = 0; i < PC; i++)
       {
         for(int j = 0; j < PR; j++)
@@ -243,9 +243,10 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       //so this loop could be a kernel launch with some A columns given to each SM
       for(int applyCol = pc + PC; applyCol < n; applyCol++)
       {
+        printf("Updating trailing column %d\n", applyCol);
         //The new column, to be copied back into A
-        Scalar Acol[PR];     //these vectors both go in shared
-        Scalar newAcol[PR];
+        Scalar* Acol = malloc(PR * sizeof(Scalar));     //these vectors both go in shared
+        Scalar* newAcol = malloc(PR * sizeof(Scalar));
         //gives perfect minimal memory bandwidth:
         //each entry read/written once in optimally coalesced accesses
         //the IA term above is implicit (other term added to this one)
@@ -276,12 +277,18 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         {
           mat[pr + i + applyCol * m] = newAcol[i];
         }
+        free(Acol);
+        free(newAcol);
       }
       for(int i = 0; i < PC; i++)
       {
         printf("updating tau[%d] value = %f\n", i + pc, panelTau[i]);
         tau[i + pc] = panelTau[i];
       }
+      free(panel);
+      free(W);
+      free(Y);
+      free(panelTau);
     }
   }
 }
@@ -377,7 +384,7 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 int main()
 {
   int m = PR;
-  int n = PC;
+  int n = PC * 2;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* RV = malloc(m * n * sizeof(Scalar));
