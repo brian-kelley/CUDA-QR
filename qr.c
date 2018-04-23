@@ -213,7 +213,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
             Scalar val = Acol[vindex];
             for(int i = 0; i < vlen; i++)
             {
-              val -= panelTau[col] * v[vindex] * v[i] * Acol[vindex];
+              val -= panelTau[col] * v[vindex] * v[i] * Acol[i];
             }
             panel[applyCol][applyRow] = val;
           }
@@ -337,6 +337,8 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
         H[k + j * m] -= tau[i] * v[k] * v[j];
       }
     }
+    //dgemm can't multiply Q by H in-place,
+    //so make a persistent copy of Q
     Scalar* prevQ = malloc(m * m * sizeof(Scalar));
     for(int j = 0; j < m * m; j++)
       prevQ[j] = Q[j];
