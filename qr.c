@@ -35,12 +35,14 @@ void printMat(Scalar* mat, int m, int n)
 //mat should be column-major
 void mmqr(Scalar* mat, Scalar* tau, int m, int n)
 {
+  printf("QR factorization of %d by %d matrix\n", m, n);
   //iterate over all subdiagonal panels
   //first left to right
   for(int pc = 0; pc < n; pc += PC)
   {
     //then bottom to top, sliding panel up by R-C each iteration
-    for(int pr = m - PR; pr >= pc; pr -= (PR-PC))
+    //for(int pr = m - PR; pr + PR > pc; pr -= (PR-PC))
+    for(int pr = 0; pr < 1; pr += (PR-PC))
     {
       printf("Processing panel at col %d, row %d\n", pc, pr);
       //load panel into shared memory, one column at a time
@@ -51,9 +53,9 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       {
         panelTau[i] = 0;
       }
-      for(int col = 0; col < PC; col++)
+      for(int col = pc; col < pc + PC; col++)
       {
-        for(int row = 0; row < PR; row++)
+        for(int row = pr; row < pr + PR; row++)
         {
           panel[col][row] = mat[row + col * m];
         }
@@ -66,7 +68,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       //should be in shared and is updated as each reflector is determined
       //
       //TODO: columns of Y matrix are just the reflectors, so an explicit
-      //copy of it is unnecessary
+      //copy of it is unnecessary (in final version, read it from panel subdiagonal)
       Scalar W[PC][PR];
       Scalar Y[PC][PR];
       for(int i = 0; i < PC; i++)
@@ -81,25 +83,22 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       bool bottomPanel = pr == m - PR;
       //does col 0 of panel cross A's diagonal?
       bool topPanel = pr <= pc;
-      if(bottomPanel)
-        puts("Panel hits bottom of matrix");
-      else
-        puts("Panel does NOT hit bottom of matrix");
-      if(topPanel)
-        puts("Panel hits top of matrix");
-      else
-        puts("Panel does NOT hit top of matrix");
       //update each trailing column (pr:pr+R, pc+C:N):
       //for each column, compute HH reflectors
       for(int col = 0; col < PC; col++)
       {
         printf("//////////////////////////////////\n");
-        printf("Doing column %d\n", col);
+        printf("Doing column %d of panel (%d, %d)\n", col, pr, pc);
         printf("//////////////////////////////////\n");
         //(middle panels are both top and bottom)
         int vstart;
         int vend;
-        if(bottomPanel)
+        if(topPanel && bottomPanel)
+        {
+          vstart = pc - pr + col;
+          vend = PR;
+        }
+        else if(!topPanel && bottomPanel)
         {
           vstart = col;
           vend = PR;
@@ -153,49 +152,49 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         putchar('\n');
         //update W matrix
         //beta is from Algorithm 3 of Kerr
-        /*
         Scalar beta = 2 / innerProd;
         //compute z = -Bv - WY^T * v
-        Scalar z[R];
-        for(int i = 0; i < R; i++)
+        Scalar z[PR];
+        for(int i = 0; i < PR; i++)
         {
-          z[i] = 0;
           if(i >= vstart && i < vend)
-            z[i] = -beta * v[i - vstart];
+            z[i] = -beta * v[i];
+          else
+            z[i] = 0;
         }
-        for(int i = 0; i < R; i++)
+        for(int i = 0; i < PR; i++)
         {
           //finish computing entry i of z
           //compute zval as entry i of W * Y^T * v
           Scalar zval = 0;
-          for(int j = 0; j < R; j++)
+          for(int j = 0; j < PR; j++)
           {
-            //need inner product of row i of W and column j of Y
+            //need inner product of row i of W and row j of Y
+            //this is (WY^T)(i, j)
             //use the fact that only the first col+1 columns of W and Y are nonzero
             if(j >= vstart && j < vend)
             {
               Scalar wyt = 0;
-              for(int k = 0; k < col + 1; k++)
+              for(int k = 0; k < col; k++)
               {
-                wyt += W[k][i] * Y[j][k];
+                wyt += W[k][i] * Y[k][j];
               }
-              zval += wyt * v[j - vstart];
+              zval += wyt * v[j];
             }
           }
           z[i] -= beta * zval;
         }
         //z is the next column of W
-        for(int i = 0; i < R; i++)
+        for(int i = 0; i < PR; i++)
         {
           W[col][i] = z[i];
         }
         //v is the next column of Y
         //note that Y is zeroed out initially, so only need to copy nonzeros
-        for(int i = vstart; i < vend; i++)
+        for(int i = 0; i < vlen; i++)
         {
-          Y[col][i] = v[i - vstart];
+          Y[col][i + vstart] = v[i];
         }
-        */
         panelTau[col] = sign * u / norm;
         //apply reflector in col to remaining columns in panel
         for(int applyCol = col + 1; applyCol < PC; applyCol++)
@@ -229,13 +228,19 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       {
         for(int row = 0; row < PR; row++)
         {
-          mat[row + col * m] = panel[col][row];
+          mat[(row + pr) + (col + pc) * m] = panel[col][row];
         }
       }
+      printf("******************************\n");
+      printf("UPDATING TRAILING COLUMNS OF A\n");
+      printf("******************************\n");
+      printf("W matrix:\n");
+      printMat((Scalar*) &W[0][0], PR, PC);
+      printf("Y matrix:\n");
+      printMat((Scalar*) &Y[0][0], PR, PC);
       //update trailing columns of A: A = (I + YW^T)A
       //the new columns of A can be updated independently (and in parallel)
       //so this loop could be a kernel launch with some A columns given to each SM
-      /*
       for(int applyCol = pc + PC; applyCol < n; applyCol++)
       {
         //The new column, to be copied back into A
@@ -272,7 +277,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
           mat[pr + i + applyCol * m] = newAcol[i];
         }
       }
-      */
       for(int i = 0; i < PC; i++)
       {
         printf("updating tau[%d] value = %f\n", i + pc, panelTau[i]);
@@ -373,7 +377,7 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 int main()
 {
   int m = PR;
-  int n = PC;
+  int n = PC * 2;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* RV = malloc(m * n * sizeof(Scalar));
@@ -409,9 +413,15 @@ int main()
   printMat(QR, m, n);
   printf("QR-A (should be 0):\n");
   Scalar* QRmA = malloc(m * n * sizeof(Scalar));
+  Scalar errNorm = 0;
   for(int i = 0; i < m * n; i++)
+  {
     QRmA[i] = QR[i] - A[i];
+    errNorm += QRmA[i] * QRmA[i];
+  }
   printMat(QRmA, m, n);
+  errNorm = sqrt(errNorm);
+  printf("Final error (residual): %.8f\n", errNorm);
   free(QRmA);
   free(QR);
   free(RV);
