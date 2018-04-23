@@ -77,33 +77,25 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
           Y[i][j] = 0;
         }
       }
+      //is the panel at the bottom of A?
+      bool bottomPanel = pr == m - PR;
+      //does col 0 of panel cross A's diagonal?
+      bool topPanel = pr <= pc;
+      if(bottomPanel)
+        puts("Panel hits bottom of matrix");
+      else
+        puts("Panel does NOT hit bottom of matrix");
+      if(topPanel)
+        puts("Panel hits top of matrix");
+      else
+        puts("Panel does NOT hit top of matrix");
       //update each trailing column (pr:pr+R, pc+C:N):
       //for each column, compute HH reflectors
       for(int col = 0; col < PC; col++)
       {
-        Scalar innerProd = 0;
-        printf("Computing norm of subdiagonal A entries (col %d)\n", col);
-        for(int row = col; row < PR; row++)
-        {
-          innerProd += panel[col][row] * panel[col][row];
-        }
-        printf("inner prod is %f\n", innerProd);
-        Scalar norm = sqrt(innerProd);
-        Scalar sign = panel[col][col] < 0 ? -1 : 1;
-        Scalar u = panel[col][col] + sign * norm;
-        panel[col][col] = -sign * norm;
-        //is the panel at the bottom of A?
-        bool bottomPanel = pr == m - PR;
-        //does col 0 of panel cross A's diagonal?
-        bool topPanel = pr <= pc;
-        if(bottomPanel)
-          puts("Panel hits bottom of matrix");
-        else
-          puts("Panel does NOT hit bottom of matrix");
-        if(topPanel)
-          puts("Panel hits top of matrix");
-        else
-          puts("Panel does NOT hit top of matrix");
+        printf("//////////////////////////////////\n");
+        printf("Doing column %d\n", col);
+        printf("//////////////////////////////////\n");
         //(middle panels are both top and bottom)
         int vstart;
         int vend;
@@ -125,6 +117,18 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
           vstart = col;
           vend = PR - col - 1;
         }
+        Scalar innerProd = 0;
+        printf("Computing norm of subdiagonal A entries (col %d)\n", col);
+        for(int row = vstart; row < vend; row++)
+        {
+          innerProd += panel[col][row] * panel[col][row];
+        }
+        printf("inner prod is %f\n", innerProd);
+        Scalar norm = sqrt(innerProd);
+        Scalar sign = (panel[col][col] < 0) ? -1.0 : 1.0;
+        Scalar u = panel[col][col] + sign * norm;
+        printf("u is %f\n", u);
+        panel[col][col] = -sign * norm;
         printf("in col %d of panel, v in rows [%d, %d)\n", col, vstart, vend);
         int vlen = vend - vstart;
         Scalar* v = malloc(vlen * sizeof(Scalar));
@@ -206,10 +210,10 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
           for(int applyRow = vstart; applyRow < vend; applyRow++)
           {
             int vindex = applyRow - vstart;
-            Scalar val = Acol[applyRow];
+            Scalar val = Acol[vindex];
             for(int i = 0; i < vlen; i++)
             {
-              val -= panelTau[applyCol] * v[vindex] * v[i] * Acol[applyRow];
+              val -= panelTau[col] * v[vindex] * v[i] * Acol[vindex];
             }
             panel[applyCol][applyRow] = val;
           }
@@ -312,13 +316,13 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
   identity(Q, m);
   for(int i = 0; i < n; i++)
   {
-    Scalar* v = malloc(n * sizeof(Scalar));
+    Scalar* v = malloc(m * sizeof(Scalar));
     for(int j = 0; j < i; j++)
     {
       v[j] = 0;
     }
     v[i] = 1;
-    for(int j = i + 1; j < n; j++)
+    for(int j = i + 1; j < m; j++)
     {
       v[j] = A[i * m + j];
     }
