@@ -9,8 +9,8 @@
 //Scalar may be either float or double
 //(2RC + C) * sizeof(Scalar) must fit in 48 KiB
 #define Scalar float
-#define PR 16
-#define PC 4
+#define PR 4
+#define PC 2
 
 void printMat(Scalar* mat, int m, int n);
 void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n);
@@ -103,13 +103,13 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
           //vstart needs to be at or below A's diagonal, even if
           //panel boundaries extends above it
           vstart = pc - pr + col;
-          vend = PR - col - 1;
+          vend = PR - PC + col + 1;
         }
         else
         {
           //neither top nor bottom panel
           vstart = col;
-          vend = PR - col - 1;
+          vend = PR - PC + col + 1;
         }
         int vlen = vend - vstart;
         Scalar innerProd = 0;
@@ -124,8 +124,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         Scalar sign = (panel[col][vstart] < 0) ? -1.0 : 1.0;
         Scalar u = panel[col][vstart] + sign * norm;
         panelTau[col] = sign * u / norm;
-        //beta is from Algorithm 3 of Kerr
-        Scalar beta = 2 / innerProd;
         printf("u is %f\n", u);
         panel[col][vstart] = -sign * norm;
         printf("in col %d of panel, v in rows [%d, %d)\n", col, vstart, vend);
@@ -151,7 +149,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         for(int i = 0; i < PR; i++)
         {
           if(i >= vstart && i < vend)
-            //z[i] = -beta * v[i - vstart];
             z[i] = -panelTau[col] * v[i - vstart];
           else
             z[i] = 0;
@@ -445,8 +442,8 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 
 int main()
 {
-  int m = PR;
-  int n = PC * 2;
+  int m = PR + (PR-PC);
+  int n = PC;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* RV = malloc(m * n * sizeof(Scalar));
