@@ -4,10 +4,9 @@
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <sys/time.h>
 
-//Scalar type and panel size (RxC)
-//Scalar may be either float or double
-//(2RC + C) * sizeof(Scalar) must fit in 48 KiB
+//Scalar type and panel width
 #define Scalar float
 #define PC 2
 
@@ -315,15 +314,21 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
   }
 }
 
+#define HANDLE_ERROR(x) \
+{\
+  cudaError_t err = x; \
+  if(x) {printf("CUDA error on line %i: %d\n", __LINE__, x); exit(1);} \
+}
+
 //Host wrapper for the main CUDA kernel
 //No extra overhead since copies to/from device would be necessary anyway
 void mmqr(Scalar* mat, Scalar* tau, int m, int n)
 {
   Scalar* Adev;
-  cudaMalloc((void**) &Adev, m * n * sizeof(Scalar));
+  HANDLE_ERROR(cudaMalloc((void**) &Adev, m * n * sizeof(Scalar)));
   Scalar* tauDev;
-  cudaMalloc((void**) &tauDev, n * sizeof(Scalar));
-  cudaMemcpy(Adev, mat, m * n * sizeof(Scalar), cudaMemcpyHostToDevice);
+  HANDLE_ERROR(cudaMalloc((void**) &tauDev, n * sizeof(Scalar)));
+  HANDLE_ERROR(cudaMemcpy(Adev, mat, m * n * sizeof(Scalar), cudaMemcpyHostToDevice));
   //launch the kernel
   //
   //only use one block and fixed threads for main kernel,
@@ -332,72 +337,28 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   //want to use every SM in order to use all shared memory in device
   //figure out how many SMs there are
   cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, 0);
+  HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
   int sm = prop.multiProcessorCount;
   printf("Executing mmqr on device 0 (%s) with %d SMs\n", prop.name, sm);
+  printf("Device has %zu bytes of shared mem per block\n", prop.sharedMemPerBlock);
   mmqrKernel<<<1, 1>>>(Adev, tauDev, m, n, sm);
   //retrieve A and tau
-  cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost);
-  cudaMemcpy(tau, tauDev, n * sizeof(Scalar), cudaMemcpyDeviceToHost);
+  HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
+  HANDLE_ERROR(cudaMemcpy(tau, tauDev, n * sizeof(Scalar), cudaMemcpyDeviceToHost));
   cudaFree(tauDev);
   cudaFree(Adev);
 }
 
-#define N 16
-
-__global__ void add( int *a, int *b, int *c )
-{
-   int tid = blockIdx.x; // handle the data at this index
-    if (tid < N)
-       c[tid] = a[tid] + b[tid];
-}
-
-#define HANDLE_ERROR(x) if(x) {printf("CUDA error %d\n", x); exit(1);}
-
-void test()
-{
-  int a[N], b[N], c[N];
-  int *dev_a, *dev_b, *dev_c;
-  // allocate the memory on the GPU
-  HANDLE_ERROR( cudaMalloc( (void**)&dev_a, N * sizeof(int) ) );
-  HANDLE_ERROR( cudaMalloc( (void**)&dev_b, N * sizeof(int) ) );
-  HANDLE_ERROR( cudaMalloc( (void**)&dev_c, N * sizeof(int) ) );
-  // fill the arrays 'a' and 'b' on the CPU
-  for (int i=0; i<N; i++) {
-    a[i] = -i;
-    b[i] = i * i;
-  }
-  // copy the arrays 'a' and 'b' to the GPU
-  HANDLE_ERROR( cudaMemcpy( dev_a, a, N * sizeof(int),
-        cudaMemcpyHostToDevice ) );
-  HANDLE_ERROR( cudaMemcpy( dev_b, b, N * sizeof(int),
-        cudaMemcpyHostToDevice ) );
-  add<<<N,1>>>( dev_a, dev_b, dev_c );
-  // copy the array 'c' back from the GPU to the CPU
-  HANDLE_ERROR( cudaMemcpy( c, dev_c, N * sizeof(int),
-        cudaMemcpyDeviceToHost ) );
-  // display the results
-  for (int i=0; i<N; i++) {
-    printf( "%d + %d = %d\n", a[i], b[i], c[i] );
-  }
-  // free the memory allocated on the GPU
-  cudaFree( dev_a );
-  cudaFree( dev_b );
-  cudaFree( dev_c );
-}
-
 int main()
 {
-  test();
-  return 0;
   //only use one device (at least, for now)
-  //cudaSetDevice(0);
+  HANDLE_ERROR(cudaSetDevice(0));
   //First, make sure device is using proper 48 KB of shared, 16 KB L1
   //during all calls to L1 kernel
   //Note that this is not the default
-  //cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
-  int m = PC * 4;
-  int n = PC * 2;
+  HANDLE_ERROR(cudaDeviceSetCacheConfig(cudaFuncCachePreferShared));
+  int m = PC * 2;
+  int n = PC;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
@@ -409,8 +370,24 @@ int main()
     A[i] = (Scalar) rand() / RAND_MAX;
     RV[i] = A[i];
   }
-  printMat(A, m, n);
-  mmqr(RV, tau, m, n);
+  //printMat(A, m, n);
+  int trials = 20;
+  double elapsed = 0;
+  struct timeval currentTime;
+  gettimeofday(&currentTime, NULL);
+  for(int i = 0; i < trials; i++)
+  {
+    mmqr(RV, tau, m, n);
+    struct timeval nextTime;
+    gettimeofday(&nextTime, NULL);
+    //add to elapsed time
+    elapsed += (nextTime.tv_sec + 1e-6 * nextTime.tv_usec) - (currentTime.tv_sec + 1e-6 * currentTime.tv_usec);
+    currentTime = nextTime;
+    //refresh RV for next trial (this isn't part of the algorithm and so isn't timed)
+    if(i != trials - 1)
+      memcpy(RV, A, m * n * sizeof(Scalar));
+  }
+  printf("Ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, elapsed / trials, trials);
   //printf("A raw storage after QR:\n");
   //printMat(RV, m, n);
   Scalar* Q = (Scalar*) malloc(m * m * sizeof(Scalar));

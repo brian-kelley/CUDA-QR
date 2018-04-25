@@ -4,10 +4,9 @@
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <sys/time.h>
 
-//Scalar type and panel size (RxC)
-//Scalar may be either float or double
-//(2RC + C) * sizeof(Scalar) must fit in 48 KiB
+//Scalar type and panel width
 #define Scalar float
 #define PC 2
 
@@ -320,7 +319,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
 {
   Scalar* Adev = malloc(m * n * sizeof(Scalar));
   Scalar* tauDev = malloc(n * sizeof(Scalar));
-  memcpy(Adev, mat, m * n * sizeof(Scalar));
   //launch the kernel
   //
   //only use one block and fixed threads for main kernel,
@@ -328,24 +326,23 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   //
   //want to use every SM in order to use all shared memory in device
   //figure out how many SMs there are
-  printf("Executing mmqr on device 0 (%s) with %d SMs\n", "NOT CUDA", 0);
+  memcpy(Adev, mat, m * n * sizeof(Scalar));
   mmqrKernel(Adev, tauDev, m, n, 0);
-  //retrieve A and tau
   memcpy(mat, Adev, m * n * sizeof(Scalar));
   memcpy(tau, tauDev, n * sizeof(Scalar));
-  free(tauDev);
+  //retrieve A and tau
   free(Adev);
+  free(tauDev);
 }
 
 int main()
 {
   //only use one device (at least, for now)
-  //cudaSetDevice(0);
   //First, make sure device is using proper 48 KB of shared, 16 KB L1
   //during all calls to L1 kernel
   //Note that this is not the default
-  int m = PC * 4;
-  int n = PC * 2;
+  int m = PC * 2;
+  int n = PC;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
@@ -357,18 +354,26 @@ int main()
     A[i] = (Scalar) rand() / RAND_MAX;
     RV[i] = A[i];
   }
-  printMat(A, m, n);
-  mmqr(RV, tau, m, n);
+  //printMat(A, m, n);
+  int trials = 20;
+  double elapsed = 0;
+  struct timeval currentTime;
+  gettimeofday(&currentTime, NULL);
+  for(int i = 0; i < trials; i++)
+  {
+    mmqr(RV, tau, m, n);
+    struct timeval nextTime;
+    gettimeofday(&nextTime, NULL);
+    //add to elapsed time
+    elapsed += (nextTime.tv_sec + 1e-6 * nextTime.tv_usec) - (currentTime.tv_sec + 1e-6 * currentTime.tv_usec);
+    currentTime = nextTime;
+    //refresh RV (this isn't part of the algorithm and so isn't timed)
+    if(i != trials - 1)
+      memcpy(RV, A, m * n * sizeof(Scalar));
+  }
+  printf("Ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, elapsed / trials, trials);
   //printf("A raw storage after QR:\n");
   //printMat(RV, m, n);
-  /*
-  printf("tau values after QR:\n");
-  for(int i = 0; i < n; i++)
-  {
-    printf("%f ", tau[i]);
-  }
-  putchar('\n');
-  */
   Scalar* Q = (Scalar*) malloc(m * m * sizeof(Scalar));
   Scalar* R = (Scalar*) malloc(m * n * sizeof(Scalar));
   explicitQR(RV, tau, Q, R, m, n);
