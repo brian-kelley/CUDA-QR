@@ -123,7 +123,8 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         printf("Top entry in column (determining sign) is col %d, row %d\n", col, vstart);
         Scalar sign = (panel[col][vstart] < 0) ? -1.0 : 1.0;
         Scalar u = panel[col][vstart] + sign * norm;
-        panelTau[col] = sign * u / norm;
+        Scalar thisTau = sign * u / norm;
+        panelTau[col] = thisTau;
         printf("u is %f\n", u);
         panel[col][vstart] = -sign * norm;
         printf("in col %d of panel, v in rows [%d, %d)\n", col, vstart, vend);
@@ -144,7 +145,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         }
         putchar('\n');
         //update W matrix
-        //compute z = -Bv - WY^T * v
         Scalar z[PR];
         for(int i = 0; i < PR; i++)
         {
@@ -442,8 +442,8 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 
 int main()
 {
-  int m = PR + (PR-PC);
-  int n = PC;
+  int m = PR;
+  int n = PC * 2;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* RV = malloc(m * n * sizeof(Scalar));
@@ -487,7 +487,7 @@ int main()
   }
   printMat(QRmA, m, n);
   errNorm = sqrt(errNorm);
-  printf("Final error (residual): %.9f\n", errNorm);
+  printf("Final error (residual): %.9g\n", errNorm);
   free(QRmA);
   free(QR);
   free(RV);
