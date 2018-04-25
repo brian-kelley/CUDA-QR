@@ -1,0 +1,15 @@
+#BSUB -J cudaQR           # job name
+#BSUB -L /bin/bash        # job's execution environment
+#BSUB -W 0:10             # wall clock runtime limit 
+#BSUB -n 1                # number of cores
+#BSUB -R "span[ptile=1]"       # number of cores per node
+#BSUB -R "select[gpu]"
+#BSUB -o %J.out           # file name for the job's standard output
+##
+# <--- at this point the current working directory is the one you submitted the job from.
+#
+module load intel/2017A   # load Intel software stack 
+module load CUDA
+
+./qr_device.exe
+
