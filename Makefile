@@ -1,7 +1,7 @@
 all: host
 
 device:
-	nvcc -arch=sm_35 qr.cu -o qr_device.exe
+	nvcc -arch=compute_35 qr.cu -o qr_device.exe
 
 host: qr.c
 	gcc -Wall -Wshadow -Wextra -g qr.c -o qr_host.exe -lm
