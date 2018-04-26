@@ -42,8 +42,11 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
 {
   //useful to think of shared memory buffer as a stack
   //for simple dynamic allocations
-  Scalar* panel = &mat[pc * m];
-  __shared__ Scalar panelTau[PC];
+  volatile Scalar* panel = &mat[pc * m];
+  extern __shared__ char sharedBuf[];
+  char* sharedStack = sharedBuf;
+  Scalar* panelTau = (Scalar*) sharedStack;
+  sharedStack += PC * sizeof(Scalar);
   //zero out W
   for(int i = 0; i < m * n; i += blockDim.x)
   {
@@ -56,7 +59,6 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
     //(middle panels are both top and bottom)
     int vstart = col + pc;
     int vend = m;
-    int vlen = vend - vstart;
     //note: when computing tau/reflectors,
     //work directly with global mat (only 2 flops per element anyway)
     //compute the inner product and norm of column
@@ -73,10 +75,10 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
       }
       //now, sum up the localInnerProds across the whole block
       //write the partial sums to shared, then do a simple linear reduction
-      Scalar* toReduce = (Scalar*) sharedBuf;
+      Scalar* toReduce = (Scalar*) sharedStack;
       toReduce[threadIdx.x] = localInnerProd;
       __syncthreads();
-      Scalar* finalReduce = ((Scalar*) sharedBuf) + blockDim.x;
+      Scalar* finalReduce = ((Scalar*) sharedStack) + blockDim.x;
       int numFinal = blockDim.x / 16;
       if(blockDim.x & 0xF)
         numFinal++;
@@ -218,9 +220,6 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
   //Is a flat 48 KiB buffer, free for use by each block
   extern __shared__ char sharedBuf[];
   char* sharedStack = sharedBuf;
-  //all blocks need an mx1 vector for scratch space (call it Acol)
-  //the proper amount of global memory (for all blocks) is already allocated in AcolGlobal
-  Scalar* Acol = AcolGlobal + gridDim.x * m * sizeof(Scalar);
   //determine range of rows "owned" by this thread
   //Allocate some shared arrays that all blocks will use for computations
   //Note: W is not transposed to coalesce memory accesses
@@ -268,9 +267,7 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
       int matRow = blockRow + row;
       int matCol = blockCol + col;
       if(matRow < m && matCol < n)
-      {
         matScratch[matRow + matCol * m] = mat[matRow + matCol * m];
-      }
     }
   }
   for(int factorBlock = 0; factorBlock < m; factorBlock += PR)
@@ -288,6 +285,8 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
         int matCol = blockCol + col;
         if(matRow < m && matCol < n)
           Wblock[row + col * PR] = W[row + factorBlock + matCol * m];
+        else
+          Wblock[row + col * PR] = 0;
       }
     }
     //load block from A
@@ -301,7 +300,10 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
         //Y's columns are simply the reflectors stored in mat's subdiagonal
         int matRow = blockRow + row;
         int matCol = blockCol + col;
-        Ablock[row + col * PR] = mat[row + (factorBlock + col) * m];
+        if(matRow < m && matCol < n)
+          Ablock[row + col * PR] = mat[factorBlock + row + matCol * m];
+        else
+          Ablock[row + col * PR] = 0;
       }
     }
     //compute all the updates in matScratch (one per thread until done)
@@ -312,42 +314,27 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
       {
         int row = index % PR;
         int col = index / PR;
-        int 
-        if(row < m && col < n)
+        int matRow = blockRow + row;
+        int matCol = blockCol + col;
+        if(matRow < m && matCol < n)
         {
-          //need to compute (Wblock * Yblock) * Ablock, then add entries of product to matScratch
+          //need to compute (Wblock * Yblock) * Ablock, then add entries of that product to matScratch
+          //compute partial = dot product of row'th row of Yblock * Wblock^T, and col'th col of Ablock
+          Scalar partial = 0;
+          for(int j = 0; j < PR; j++)
+          {
+            Scalar ywt = 0;
+            for(int k = 0; k < PC; k++)
+            {
+              ywt += Yblock[row + k * PR] * Wblock[col + k * PR];
+            }
+            partial += ywt * Ablock[j + col * PR];
+          }
+          matScratch[matRow + matCol * m] += partial;
         }
       }
     }
-    //now compute YW^T * A[<panel rows>, applyCol] and update newAcol
-    for(int i = 0; i < m; i++)
-    {
-      Scalar newAval = 0;
-      for(int j = 0; j < m; j++)
-      {
-        //need inner product of row i of Y and row j of W
-        //generate entry (Y*W^T)(i, j)
-        Scalar ywt = 0;
-        for(int k = 0; k < PC; k++)
-        {
-          //yval = Y(i, k) is an element of v reflectors
-          Scalar yval = 0;
-          if(i > k)
-            yval = panel[k * m + j];
-          else if(i == k)
-            yval = 1;
-          ywt += yval * W[k * m + j];
-        }
-        //multiply that by entry j of A
-        newAval += ywt * Acol[j];
-      }
-      newAcol[i] += newAval;
-    }
-    //write back newAcol
-    for(int i = 0; i < m; i++)
-    {
-      mat[i + applyCol * m] = newAcol[i];
-    }
+    __syncthreads();
   }
 }
 
@@ -463,7 +450,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   //figure out how many SMs there are
   cudaDeviceProp prop;
   HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
-  int sm = prop.multiProcessorCount;
   int shmem = prop.sharedMemPerBlock;
   int maxThreads = prop.maxThreadsPerBlock;
   //MUST have at least 48 KiB of shared memory for this to work in its current state
@@ -475,9 +461,43 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   }
   //want one block per SM and as many threads as possible (up to 1 per row of A)
   int threadsPerBlock = m < maxThreads ? m : maxThreads;
-  //call kernel with one block and many threads
-  //this kernel will launch many blocks to do trailing update (asynchronously)
-  mmqrKernel<<<1, threadsPerBlock, shmem, 0>>>(Adev, tauDev, m, n, sm);
+  Scalar* W;
+  Scalar* matScratch;
+  Scalar* z; 
+  Scalar* Acol;
+  cudaMalloc((void**) &W, m * PC * sizeof(Scalar));
+  cudaMalloc((void**) &z, m * sizeof(Scalar));
+  cudaMalloc((void**) &Acol, m * sizeof(Scalar));
+  cudaMalloc((void**) &matScratch, m * n * sizeof(Scalar));
+  cudaMemcpy(matScratch, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToDevice);
+  for(int pc = 0; pc < n; pc += PC)
+  {
+    printf("Launching block HH kernel (1 block, %d threads) with %d bytes shared\n", threadsPerBlock, shmem);
+    panelHouseholderKernel<<<1, threadsPerBlock, shmem>>>(Adev, tauDev, W, z, Acol, m, n, pc);
+    int changedColumns = PC;
+    if(changedColumns + pc > n)
+      changedColumns = n - pc;
+    cudaMemcpy(matScratch + m * pc, Adev + m * pc, m * changedColumns * sizeof(Scalar), cudaMemcpyDeviceToDevice);
+    //now, only need to update matScratch with the entries that have changed
+    if(pc + PC < n)
+    {
+      int blocksX = (m - pc - PC) / PR;
+      if((m - pc - PC) % PR)
+        blocksX++;
+      int blocksY = (n - pc) / PR;
+      if((n - pc) % PR)
+        blocksY++;
+      dim3 gridSize(blocksX, blocksY);
+      printf("Launching block update kernel (%d  blocks, %d threads) with %d bytes shared\n", gridSize.x * gridSize.y * gridSize.z, 1024, shmem);
+      trailingUpdateKernel<<<gridSize, maxThreads, shmem>>>(Adev, matScratch, tau, W, z, m, n, pc);
+      //copy trailing columns of matScratch (just updated) back to Adev
+      cudaMemcpy(Adev + m * (pc + PC), matScratch + m * (pc + PC), m * (n - pc - PC) * sizeof(Scalar), cudaMemcpyDeviceToDevice);
+    }
+  }
+  cudaFree(matScratch);
+  cudaFree(Acol);
+  cudaFree(z);
+  cudaFree(W);
   //retrieve A and tau
   HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
   HANDLE_ERROR(cudaMemcpy(tau, tauDev, n * sizeof(Scalar), cudaMemcpyDeviceToHost));
@@ -525,7 +545,7 @@ int main()
     RV[i] = A[i];
   }
   //printMat(A, m, n);
-  int trials = 20;
+  int trials = 1;
   double elapsed = 0;
   struct timeval currentTime;
   gettimeofday(&currentTime, NULL);
