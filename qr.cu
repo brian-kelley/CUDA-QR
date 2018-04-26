@@ -9,7 +9,10 @@
 //Scalar type and panel width
 #define Scalar float
 
+//PR is how big the square trailing update block matrix should be (per CUDA block)
+//(PR^2 + 2 * PR * PC) * sizeof(Scalar) should fit in 48 KiB
 #define PR 64
+//PC is how many columns of A get grouped into one compressed block Householder transform
 #define PC 8
 
 void printMat(Scalar* mat, int m, int n);
@@ -32,28 +35,32 @@ void printMat(Scalar* mat, int m, int n)
   putchar('\n');
 }
 
-//mat, W and tau are all global arrays
+//all arrays passed in are preallocated global arrays be be used by all blocks
 //mat is m*n, W is m*PC, z is m, and AcolGlobal is numBlocks * m
 //arrays declared volatile mean entries are not cached,
 //so that a threadfence_*() is sufficient to keep all values coherent
 //(meaning all writes before the fence are reflected in all reads after)
-__global__ void mmqrKernel(volatile Scalar* mat, Scalar* tau, volatile Scalar* W, volatile Scalar* z, volatile Scalar* AcolGlobal, int m, int n)
+__global__ void mmqrKernel(volatile Scalar* mat, volatile Scalar* matScratch, Scalar* tau, volatile Scalar* W, volatile Scalar* z, volatile Scalar* AcolGlobal, int m, int n)
 {
   //All dynamic shared memory goes here
   //Is a flat 48 KiB buffer, free for use by each block
   extern __shared__ char sharedBuf[];
-  char* sharedStack = sharedBuf;
   //all blocks need an mx1 vector for scratch space (call it Acol)
   //the proper amount of global memory (for all blocks) is already allocated in AcolGlobal
   Scalar* Acol = AcolGlobal + gridDim.x * m * sizeof(Scalar);
   //determine range of rows "owned" by this thread
   for(int pc = 0; pc < n; pc += PC)
   {
-    Scalar* panelTau = (Scalar*) sharedStack;
-    sharedStack += PC * sizeof(Scalar);
+    //useful to think of shared memory buffer as a stack
+    //for simple dynamic allocations
+    char* sharedStack = sharedBuf;
     Scalar* panel = &mat[pc * m];
-    if(blockIdx.x == 0)
+    //Kernel uses 2D grid (to match the way trailing matrix is partitioned among blocks)
+    if(blockIdx.x == 0 && blockIdx.y == 0)
     {
+      //"allocate" some shared space for panelTau
+      Scalar* panelTau = (Scalar*) sharedStack;
+      sharedStack += PC * sizeof(Scalar);
       //zero out W
       for(int i = 0; i < m * n; i += blockDim.x)
       {
@@ -172,36 +179,64 @@ __global__ void mmqrKernel(volatile Scalar* mat, Scalar* tau, volatile Scalar* W
         //apply reflector in col to remaining columns in panel
         for(int applyCol = col + 1; applyCol < PC; applyCol++)
         {
-          //Create a copy of the updating column of A which can
+          //Create a copy of the updating column of A which will
           //persist while each entry is computed
-          for(int i = 0; i < vlen; i++)
+          //Only the height range [vstart, vend) is read, used and written back
+          for(int i = vstart; i < m; i += blockDim.x)
           {
-            Acol[i] = panel[applyCol * m + vstart + i];
+            int index = i + threadIdx.x;
+            if(index < m)
+              Acol[index] = panel[applyCol * m + index];
           }
-          for(int applyRow = vstart; applyRow < vend; applyRow += blockDim.x)
+          __threadfence();
+          for(int applyRow = vstart; applyRow < m; applyRow += blockDim.x)
           {
-            int vindex = applyRow - vstart;
-            Scalar val = Acol[vindex];
-            for(int i = 0; i < vlen; i++)
+            int index = applyRow + threadIdx.x;
+            if(index < m)
             {
-              val -= panelTau[col] * v[vindex] * v[i] * Acol[i];
+              Scalar val = Acol[index];
+              Scalar vIndex;
+              if(index == col)
+                vIndex = 1;
+              else
+                vIndex = panel[col * m + index];
+              for(int i = vstart; i < m; i++)
+              {
+                Scalar vi;
+                if(i == col)
+                  vi = 1;
+                else
+                  vi = panel[col * m + i];
+                val -= panelTau[col] * vIndex * vi * Acol[i];
+              }
+              panel[applyCol * m + index] = val;
             }
-            panel[applyCol * m + applyRow] = val;
           }
         }
+      }
+      if(threadIdx.x < PC)
+      {
+        //finalize global tau values for this panel
+        tau[pc + threadIdx.x] = panelTau[threadIdx.x];
       }
     }
     //this is necessary to guarantee that Block 0's updates to mat/W are visible to all other blocks
     __threadfence_system();
-    //first, block 0 needs to reflect each column and then update trailing columns
-    Scalar panelTau[PC];
+    sharedStack = sharedBuf;
+    //Allocate some shared arrays that all blocks will use for computations
+    Scalar* Wblock = (Scalar*) sharedStack;
+    sharedStack += PR * PC * sizeof(Scalar);
+    Scalar* Yblock = (Scalar*) sharedStack;
+    sharedStack += PR * PC * sizeof(Scalar);
+    Scalar* Ablock = (Scalar*) sharedStack;
+    sharedStack += PR * PR * sizeof(Scalar);
     //update trailing columns of A: A = (I + YW^T)A
-    //all columns of A can be updated in parallel
-    //so this loop can be a kernel launch with a few A columns in each block
+    //Each block in the 2D grid is responsible for updating one square region of A (starting at upper-left corner of trailing part)
+    //Each block will read into Wblock/Yblock/Ablock once and write results out to Ascratch once
+    int blockRow = blockIdx.x * (m / PR);
+    int blockCol = pc + PC + blockIdx.y * (n / PR);
     for(int applyCol = pc + PC; applyCol < n; applyCol++)
     {
-      //The new column, to be copied back into A
-      Scalar* Acol = (Scalar*) malloc(m * sizeof(Scalar));     //these vectors both go in shared
       Scalar* newAcol = (Scalar*) malloc(m * sizeof(Scalar));
       //gives perfect minimal memory bandwidth:
       //each entry read/written once in optimally coalesced accesses
@@ -243,13 +278,6 @@ __global__ void mmqrKernel(volatile Scalar* mat, Scalar* tau, volatile Scalar* W
       free(Acol);
       free(newAcol);
     }
-    for(int i = 0; i < PC; i++)
-    {
-      tau[i + pc] = panelTau[i];
-    }
-    free(W);
-    free(panelTau);
-    free(panel);
     //wait for all writes of all blocks (to trailing entries of A) to complete
     //this kind of fence is expensive but is only way to synchronize across blocks
     __threadfence_system();
