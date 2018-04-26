@@ -11,7 +11,7 @@
 
 //PR is how big the square trailing update block matrix should be (per CUDA block)
 //(PR^2 + 2 * PR * PC) * sizeof(Scalar) should fit in 48 KiB
-#define PR 64
+#define PR 8
 //PC is how many columns of A get grouped into one compressed block Householder transform
 #define PC 8
 
@@ -233,8 +233,8 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
   //update trailing columns of A: A = (I + YW^T)A
   //Each block in the 2D grid is responsible for updating one square region of A (starting at upper-left corner of trailing part)
   //Each block will read into Wblock/Yblock/Ablock once and write results out to Ascratch once
-  int blockRow = blockIdx.x * (m / PR);
-  int blockCol = pc + PC + blockIdx.y * (n / PR);
+  int blockRow = pc + blockIdx.x * PR;
+  int blockCol = pc + PC + blockIdx.y * PR;
   //first load in Y block
   //it will stay constant for whole kernel
   for(int i = 0; i < PR * PC; i += blockDim.x)
@@ -472,7 +472,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   cudaMemcpy(matScratch, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToDevice);
   for(int pc = 0; pc < n; pc += PC)
   {
-    printf("Launching block HH kernel (1 block, %d threads) with %d bytes shared\n", threadsPerBlock, shmem);
     panelHouseholderKernel<<<1, threadsPerBlock, shmem>>>(Adev, tauDev, W, z, Acol, m, n, pc);
     int changedColumns = PC;
     if(changedColumns + pc > n)
@@ -488,7 +487,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       if((n - pc) % PR)
         blocksY++;
       dim3 gridSize(blocksX, blocksY);
-      printf("Launching block update kernel (%d  blocks, %d threads) with %d bytes shared\n", gridSize.x * gridSize.y * gridSize.z, 1024, shmem);
+      printf("Launching block update kernel with %dx%d grid, updating %dx%d region\n", gridSize.x, gridSize.y, m - pc, n - pc - PC);
       trailingUpdateKernel<<<gridSize, maxThreads, shmem>>>(Adev, matScratch, tau, W, z, m, n, pc);
       //copy trailing columns of matScratch (just updated) back to Adev
       cudaMemcpy(Adev + m * (pc + PC), matScratch + m * (pc + PC), m * (n - pc - PC) * sizeof(Scalar), cudaMemcpyDeviceToDevice);
@@ -531,8 +530,8 @@ int main()
     puts("Only float (32-bit) and double (64-bit) reals are supported scalar types");
     exit(1);
   }
-  int m = PC;
-  int n = PC;
+  int m = 100;
+  int n = 100;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
