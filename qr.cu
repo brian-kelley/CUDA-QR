@@ -11,9 +11,9 @@
 
 //PR is how big the square trailing update block matrix should be (per CUDA block)
 //(PR^2 + 2 * PR * PC) * sizeof(Scalar) should fit in 48 KiB
-#define PR 8
+#define PR 16
 //PC is how many columns of A get grouped into one compressed block Householder transform
-#define PC 8
+#define PC 16
 
 void printMat(Scalar* mat, int m, int n);
 void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n);
@@ -45,7 +45,6 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
   volatile Scalar* panel = &mat[pc * m];
   extern __shared__ char sharedBuf[];
   char* sharedStack = sharedBuf;
-  Scalar* panelTau = (Scalar*) sharedStack;
   sharedStack += PC * sizeof(Scalar);
   //zero out W
   for(int i = 0; i < m * PC; i += blockDim.x)
@@ -57,7 +56,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
   for(int col = 0; col < PC && pc + col < n; col++)
   {
     //(middle panels are both top and bottom)
-    int vstart = col + pc;
+    int vstart = pc + col;
     //note: when computing tau/reflectors,
     //work directly with global mat (only 2 flops per element anyway)
     //compute the inner product and norm of column
@@ -99,23 +98,26 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
     }
     Scalar norm = sqrt(innerProd);
     Scalar leading = panel[col * m + vstart];
+    __syncthreads();
     Scalar sign = (leading < 0) ? -1.0 : 1.0;
     Scalar u = leading + sign * norm;
     Scalar thisTau = sign * u / norm;
-    //compute entire w vector in-place
+    //compute entire w vector in-place, storing it back to A subdiag
     for(int i = vstart; i < m; i += blockDim.x)
     {
       int index = i + threadIdx.x;
       if(index == vstart)
       {
-        panelTau[col] = thisTau;
-        panel[col * m + index] = -sign * norm;
+        //thread 0 uniquely responsible for setting R diagonal entry and tau
+        tau[pc + col] = thisTau;
+        panel[col * m + vstart] = -sign * norm;
       }
       else if(index < m)
       {
         panel[col * m + index] /= u;
       }
     }
+    __threadfence_block();
     //v is now fully computed and stored back to panel
     //compute z vector using W,Y
     //each thread will compute one entry in z
@@ -125,46 +127,42 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
       if(index < m)
       {
         Scalar zval = 0;
-        if(index >= vstart)
+        //set zval to v[index]
+        if(index == vstart)
+          zval = -thisTau;
+        else if(index > vstart)
+          zval = -thisTau * panel[col * m + index];
+        //finish computing entry i of z
+        //compute zval as (W * Y^T * v)(i)
+        Scalar wytvi = 0;
+        for(int j = vstart; j < m; j++)
         {
-          if(index == vstart)
-            zval = -thisTau;
-          else
-            zval = -thisTau * panel[col * m + index];
-          //finish computing entry i of z
-          //compute zval as (W * Y^T * v)(i)
-          Scalar wytvi = 0;
-          for(int j = 0; j < m; j++)
+          //need inner product of row i of W and row j of Y
+          //this is (WY^T)(i, j)
+          //use the fact that only the first col+1 columns of W and Y are nonzero
+          Scalar wyt = 0;
+          for(int k = 0; k < col; k++)
           {
-            //need inner product of row i of W and row j of Y
-            //this is (WY^T)(i, j)
-            //use the fact that only the first col+1 columns of W and Y are nonzero
-            Scalar wyt = 0;
-            for(int k = 0; k < col; k++)
-            {
-              Scalar yval = 0;
-              if(j > k)
-                yval = panel[k * m + j];
-              else if(j == k)
-                yval = 1;
-              wyt += W[k * m + index] * yval;
-            }
-            wytvi += wyt * panel[col * m + j];
+            Scalar yval = 0;
+            int kColVstart = pc + k;
+            if(j > kColVstart)
+              yval = panel[k * m + j];
+            else if(j == kColVstart)
+              yval = 1;
+            wyt += W[k * m + index] * yval;
           }
-          zval -= thisTau * wytvi;
+          Scalar vval = 0;
+          if(j > vstart)
+            vval = panel[col * m + j];
+          else if(j == vstart)
+            vval = 1;
+          wytvi += wyt * vval;
         }
-        z[index] = zval;
+        zval -= thisTau * wytvi;
+        W[col * m + index] = zval;
       }
     }
-    __syncthreads();  //make z coherent across threads
-    //z is the next column of W
-    for(int i = 0; i < m; i += blockDim.x)
-    {
-      int index = i + threadIdx.x;
-      if(index < m)
-        W[col * m + index] = z[index];
-    }
-    __syncthreads();  //make W coherent
+    __threadfence_block();
     //apply reflector in col to remaining columns in panel
     for(int applyCol = col + 1; applyCol < PC && pc + applyCol < n; applyCol++)
     {
@@ -184,14 +182,14 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
         if(index < m)
         {
           Scalar val = Acol[index];
-          Scalar vIndex;
+          Scalar vIndex = 0;
           if(index == col)
             vIndex = 1;
           else
             vIndex = panel[col * m + index];
           for(int i = vstart; i < m; i++)
           {
-            Scalar vi;
+            Scalar vi = 0;
             if(i == col)
               vi = 1;
             else
@@ -202,14 +200,6 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
         }
       }
       __syncthreads();
-    }
-  }
-  for(int i = 0; i < PC; i += blockDim.x)
-  {
-    if((i + threadIdx.x) + pc < n)
-    {
-      //finalize global tau values for this panel
-      tau[pc + i + threadIdx.x] = panelTau[i + threadIdx.x];
     }
   }
 }
@@ -538,8 +528,8 @@ int main()
     puts("Only float (32-bit) and double (64-bit) reals are supported scalar types");
     exit(1);
   }
-  int m = PC * 2;
-  int n = PC * 2;
+  int m = PC;
+  int n = PC;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));

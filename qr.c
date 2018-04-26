@@ -344,8 +344,8 @@ int main()
   //First, make sure device is using proper 48 KB of shared, 16 KB L1
   //during all calls to L1 kernel
   //Note that this is not the default
-  int m = PC * 2;
-  int n = PC * 2;
+  int m = PC;
+  int n = PC;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
