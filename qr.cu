@@ -48,11 +48,11 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
   Scalar* panelTau = (Scalar*) sharedStack;
   sharedStack += PC * sizeof(Scalar);
   //zero out W
-  for(int i = 0; i < m * n; i += blockDim.x)
+  for(int i = 0; i < m * PC; i += blockDim.x)
   {
     int index = i + threadIdx.x;
     if(index < m * n)
-      W[i] = 0;
+      W[index] = 0;
   }
   for(int col = 0; col < PC && pc + col < n; col++)
   {
@@ -162,7 +162,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
     }
     __syncthreads();  //make W coherent
     //apply reflector in col to remaining columns in panel
-    for(int applyCol = col + 1; applyCol < PC; applyCol++)
+    for(int applyCol = col + 1; applyCol < PC && pc + applyCol < n; applyCol++)
     {
       //Create a copy of the updating column of A which will
       //persist while each entry is computed
@@ -173,7 +173,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
         if(index < m)
           Acol[index] = panel[applyCol * m + index];
       }
-      __threadfence();
+      __syncthreads();
       for(int applyRow = vstart; applyRow < m; applyRow += blockDim.x)
       {
         int index = applyRow + threadIdx.x;
@@ -197,6 +197,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
           panel[applyCol * m + index] = val;
         }
       }
+      __syncthreads();
     }
   }
   for(int i = 0; i < PC; i += blockDim.x)
@@ -283,8 +284,8 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
         //W is stored explicitly in global (also column major), so just read out entries
         int matRow = blockRow + row;
         int matCol = blockCol + col;
-        if(matRow < m && matCol < n)
-          Wblock[row + col * PR] = W[row + factorBlock + matCol * m];
+        if(factorBlock + row < m)
+          Wblock[row + col * PR] = W[(factorBlock + row) + col * m];
         else
           Wblock[row + col * PR] = 0;
       }
@@ -300,7 +301,7 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
         //Y's columns are simply the reflectors stored in mat's subdiagonal
         int matRow = blockRow + row;
         int matCol = blockCol + col;
-        if(matRow < m && matCol < n)
+        if(factorBlock + row < m && matCol < n)
           Ablock[row + col * PR] = mat[factorBlock + row + matCol * m];
         else
           Ablock[row + col * PR] = 0;
@@ -530,8 +531,8 @@ int main()
     puts("Only float (32-bit) and double (64-bit) reals are supported scalar types");
     exit(1);
   }
-  int m = 100;
-  int n = 100;
+  int m = 8;
+  int n = 8;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
