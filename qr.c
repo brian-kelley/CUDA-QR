@@ -31,7 +31,7 @@ void printMat(Scalar* mat, int m, int n)
 }
 
 //mat should be column-major
-void mmqrKernel(Scalar* mat, Scalar* tau, int m, int n, int smCount)
+void mmqrKernel(Scalar* mat, Scalar* tau, int m, int n)
 {
   //iterate over all subdiagonal panels
   //first left to right
@@ -327,7 +327,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   //want to use every SM in order to use all shared memory in device
   //figure out how many SMs there are
   memcpy(Adev, mat, m * n * sizeof(Scalar));
-  mmqrKernel(Adev, tauDev, m, n, 0);
+  mmqrKernel(Adev, tauDev, m, n);
   memcpy(mat, Adev, m * n * sizeof(Scalar));
   memcpy(tau, tauDev, n * sizeof(Scalar));
   //retrieve A and tau
