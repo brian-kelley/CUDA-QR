@@ -51,7 +51,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
   for(int i = 0; i < m * PC; i += blockDim.x)
   {
     int index = i + threadIdx.x;
-    if(index < m * n)
+    if(index < m * PC)
       W[index] = 0;
   }
   for(int col = 0; col < PC && pc + col < n; col++)
@@ -76,26 +76,25 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
       //now, sum up the localInnerProds across the whole block
       //write the partial sums to shared, then do a simple linear reduction
       Scalar* toReduce = (Scalar*) sharedStack;
+      sharedStack += blockDim.x * sizeof(Scalar);
       toReduce[threadIdx.x] = localInnerProd;
-      __syncthreads();
-      Scalar* finalReduce = ((Scalar*) sharedStack) + blockDim.x;
-      int numFinal = blockDim.x / 16;
-      if(blockDim.x & 0xF)
-        numFinal++;
+      __threadfence_block();
+      Scalar* finalReduce = (Scalar*) sharedStack;
+      int numFinal = 16;
       if(threadIdx.x < numFinal)
       {
         localInnerProd = 0;
-        for(int i = 0; i < 16; i++)
+        for(int i = 0; i < blockDim.x; i += 16)
         {
-          int index = i + threadIdx.x * 16;
+          int index = i + threadIdx.x;
           if(index < blockDim.x)
             localInnerProd += toReduce[index];
         }
         finalReduce[threadIdx.x] = localInnerProd;
       }
-      __syncthreads();
+      __threadfence_block();
       //now, every thread sums up finalReduce to get innerProd
-      for(int i = 0; i < numFinal; i++)
+      for(int i = 0; i < 16; i++)
         innerProd += finalReduce[i];
     }
     Scalar norm = sqrt(innerProd);
@@ -110,7 +109,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
       if(index == vstart)
       {
         panelTau[col] = thisTau;
-        panel[col * m + vstart] = -sign * norm;
+        panel[col * m + index] = -sign * norm;
       }
       else if(index < m)
       {
@@ -127,28 +126,33 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
       {
         Scalar zval = 0;
         if(index >= vstart)
-          zval = -panelTau[col] * panel[col * m + index];
-        //finish computing entry i of z
-        //compute zval as (W * Y^T * v)(i)
-        Scalar wytvi = 0;
-        for(int j = vstart; j < m; j++)
         {
-          //need inner product of row i of W and row j of Y
-          //this is (WY^T)(i, j)
-          //use the fact that only the first col+1 columns of W and Y are nonzero
-          Scalar wyt = 0;
-          for(int k = 0; k < col; k++)
+          if(index == vstart)
+            zval = -thisTau;
+          else
+            zval = -thisTau * panel[col * m + index];
+          //finish computing entry i of z
+          //compute zval as (W * Y^T * v)(i)
+          Scalar wytvi = 0;
+          for(int j = 0; j < m; j++)
           {
-            Scalar yval = 0;
-            if(j > k)
-              yval = panel[k * m + j];
-            else if(j == k)
-              yval = 1;
-            wyt += W[k * m + i] * yval;
+            //need inner product of row i of W and row j of Y
+            //this is (WY^T)(i, j)
+            //use the fact that only the first col+1 columns of W and Y are nonzero
+            Scalar wyt = 0;
+            for(int k = 0; k < col; k++)
+            {
+              Scalar yval = 0;
+              if(j > k)
+                yval = panel[k * m + j];
+              else if(j == k)
+                yval = 1;
+              wyt += W[k * m + index] * yval;
+            }
+            wytvi += wyt * panel[col * m + j];
           }
-          wytvi += wyt * panel[col * m + j];
+          zval -= thisTau * wytvi;
         }
-        zval -= panelTau[col] * wytvi;
         z[index] = zval;
       }
     }
@@ -192,7 +196,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
               vi = 1;
             else
               vi = panel[col * m + i];
-            val -= panelTau[col] * vIndex * vi * Acol[i];
+            val -= thisTau * vIndex * vi * Acol[i];
           }
           panel[applyCol * m + index] = val;
         }
@@ -215,7 +219,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
 //arrays declared volatile mean entries are not cached,
 //so that a threadfence_*() is sufficient to keep all values coherent
 //(meaning all writes before the fence are reflected in all reads after)
-__global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matScratch, Scalar* tau, volatile Scalar* W, volatile Scalar* z, int m, int n, int pc)
+__global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matScratch, Scalar* tau, volatile Scalar* W, int m, int n, int pc)
 {
   //All dynamic shared memory goes here
   //Is a flat 48 KiB buffer, free for use by each block
@@ -282,8 +286,6 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
         int row = index % PR;
         int col = index / PR;
         //W is stored explicitly in global (also column major), so just read out entries
-        int matRow = blockRow + row;
-        int matCol = blockCol + col;
         if(factorBlock + row < m)
           Wblock[row + col * PR] = W[(factorBlock + row) + col * m];
         else
@@ -299,7 +301,6 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
         int row = index % PR;
         int col = index / PR;
         //Y's columns are simply the reflectors stored in mat's subdiagonal
-        int matRow = blockRow + row;
         int matCol = blockCol + col;
         if(factorBlock + row < m && matCol < n)
           Ablock[row + col * PR] = mat[factorBlock + row + matCol * m];
@@ -307,6 +308,7 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
           Ablock[row + col * PR] = 0;
       }
     }
+    __syncthreads();
     //compute all the updates in matScratch (one per thread until done)
     for(int i = 0; i < PR * PR; i += blockDim.x)
     {
@@ -327,7 +329,7 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
             Scalar ywt = 0;
             for(int k = 0; k < PC; k++)
             {
-              ywt += Yblock[row + k * PR] * Wblock[col + k * PR];
+              ywt += Yblock[row + k * PR] * Wblock[j + k * PR];
             }
             partial += ywt * Ablock[j + col * PR];
           }
@@ -470,15 +472,20 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   cudaMalloc((void**) &z, m * sizeof(Scalar));
   cudaMalloc((void**) &Acol, m * sizeof(Scalar));
   cudaMalloc((void**) &matScratch, m * n * sizeof(Scalar));
-  cudaMemcpy(matScratch, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToDevice);
   for(int pc = 0; pc < n; pc += PC)
   {
     panelHouseholderKernel<<<1, threadsPerBlock, shmem>>>(Adev, tauDev, W, z, Acol, m, n, pc);
+    Scalar* Whost = (Scalar*) malloc(PC * m * sizeof(Scalar));
+    cudaMemcpy(Whost, W, m * PC * sizeof(Scalar), cudaMemcpyDeviceToHost);
+    puts("W matrix:");
+    printMat(Whost, m, PC);
+    free(Whost);
     int changedColumns = PC;
     if(changedColumns + pc > n)
       changedColumns = n - pc;
-    cudaMemcpy(matScratch + m * pc, Adev + m * pc, m * changedColumns * sizeof(Scalar), cudaMemcpyDeviceToDevice);
     //now, only need to update matScratch with the entries that have changed
+    //cudaMemcpy(matScratch + m * pc, Adev + m * pc, m * changedColumns * sizeof(Scalar), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(matScratch, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToDevice);
     if(pc + PC < n)
     {
       int blocksX = (m - pc - PC) / PR;
@@ -489,7 +496,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         blocksY++;
       dim3 gridSize(blocksX, blocksY);
       printf("Launching block update kernel with %dx%d grid, updating %dx%d region\n", gridSize.x, gridSize.y, m - pc, n - pc - PC);
-      trailingUpdateKernel<<<gridSize, maxThreads, shmem>>>(Adev, matScratch, tau, W, z, m, n, pc);
+      trailingUpdateKernel<<<gridSize, maxThreads, shmem>>>(Adev, matScratch, tau, W, m, n, pc);
       //copy trailing columns of matScratch (just updated) back to Adev
       cudaMemcpy(Adev + m * (pc + PC), matScratch + m * (pc + PC), m * (n - pc - PC) * sizeof(Scalar), cudaMemcpyDeviceToDevice);
     }
@@ -531,8 +538,8 @@ int main()
     puts("Only float (32-bit) and double (64-bit) reals are supported scalar types");
     exit(1);
   }
-  int m = 8;
-  int n = 8;
+  int m = PC * 2;
+  int n = PC * 2;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
@@ -544,7 +551,8 @@ int main()
     A[i] = (Scalar) rand() / RAND_MAX;
     RV[i] = A[i];
   }
-  //printMat(A, m, n);
+  puts("A matrix:\n");
+  printMat(A, m, n);
   int trials = 1;
   double elapsed = 0;
   struct timeval currentTime;
@@ -584,7 +592,7 @@ int main()
     QRmA[i] = QR[i] - A[i];
     errNorm += QRmA[i] * QRmA[i];
   }
-  //printMat(QRmA, m, n);
+  printMat(QRmA, m, n);
   free(QRmA);
   errNorm = sqrt(errNorm);
   printf("L2 norm of residual QR-A: %.9g\n", errNorm);

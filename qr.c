@@ -8,7 +8,7 @@
 
 //Scalar type and panel width
 #define Scalar float
-#define PC 2
+#define PC 8
 
 void printMat(Scalar* mat, int m, int n);
 void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n);
@@ -164,6 +164,9 @@ void mmqrKernel(Scalar* mat, Scalar* tau, int m, int n)
       }
       free(v);
     }
+    puts("W MATRIX:\n");
+    printMat(W, m, PC);
+    putchar('\n');
     //panel, panelTau, W and Y are all fully computed
     //write back panel to A
     for(int col = 0; col < PC; col++)
@@ -342,7 +345,7 @@ int main()
   //during all calls to L1 kernel
   //Note that this is not the default
   int m = PC * 2;
-  int n = PC;
+  int n = PC * 2;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
@@ -354,8 +357,9 @@ int main()
     A[i] = (Scalar) rand() / RAND_MAX;
     RV[i] = A[i];
   }
-  //printMat(A, m, n);
-  int trials = 20;
+  puts("A matrix:\n");
+  printMat(A, m, n);
+  int trials = 1;
   double elapsed = 0;
   struct timeval currentTime;
   gettimeofday(&currentTime, NULL);
