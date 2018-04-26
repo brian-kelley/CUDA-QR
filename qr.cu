@@ -35,252 +35,319 @@ void printMat(Scalar* mat, int m, int n)
   putchar('\n');
 }
 
+//Do block Householder factorization of the first PC columns of mat, starting at pc
+//this kernel is only meant to be run on a single block with as many threads as possible
+//this is because it contains many synchronization points
+__global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volatile Scalar* W, volatile Scalar* z, volatile Scalar* Acol, int m, int n, int pc)
+{
+  //useful to think of shared memory buffer as a stack
+  //for simple dynamic allocations
+  Scalar* panel = &mat[pc * m];
+  __shared__ Scalar panelTau[PC];
+  //zero out W
+  for(int i = 0; i < m * n; i += blockDim.x)
+  {
+    int index = i + threadIdx.x;
+    if(index < m * n)
+      W[i] = 0;
+  }
+  for(int col = 0; col < PC; col++)
+  {
+    //(middle panels are both top and bottom)
+    int vstart = col + pc;
+    int vend = m;
+    int vlen = vend - vstart;
+    //note: when computing tau/reflectors,
+    //work directly with global mat (only 2 flops per element anyway)
+    //compute the inner product and norm of column
+    Scalar innerProd = 0;
+    {
+      Scalar localInnerProd = 0;
+      //use a cyclic row distribution for perfect coalesced accesses
+      for(int i = vstart; i < vend; i += blockDim.x)
+      {
+        if(i + threadIdx.x < vend)
+        {
+          localInnerProd += panel[i + col * m] * panel[i + col * m];
+        }
+      }
+      //now, sum up the localInnerProds across the whole block
+      //write the partial sums to shared, then do a simple linear reduction
+      Scalar* toReduce = (Scalar*) sharedBuf;
+      toReduce[threadIdx.x] = localInnerProd;
+      __syncthreads();
+      Scalar* finalReduce = ((Scalar*) sharedBuf) + blockDim.x;
+      int numFinal = blockDim.x / 16;
+      if(blockDim.x & 0xF)
+        numFinal++;
+      if(threadIdx.x < numFinal)
+      {
+        localInnerProd = 0;
+        for(int i = 0; i < 16; i++)
+        {
+          int index = i + threadIdx.x * 16;
+          if(index < blockDim.x)
+            localInnerProd += toReduce[index];
+        }
+        finalReduce[threadIdx.x] = localInnerProd;
+      }
+      __syncthreads();
+      //now, every thread sums up finalReduce to get innerProd
+      for(int i = 0; i < numFinal; i++)
+        innerProd += finalReduce[i];
+    }
+    Scalar norm = sqrt(innerProd);
+    Scalar leading = panel[col * m + vstart];
+    Scalar sign = (leading < 0) ? -1.0 : 1.0;
+    Scalar u = leading + sign * norm;
+    Scalar thisTau = sign * u / norm;
+    //compute entire w vector in-place
+    for(int i = vstart; i < vend; i += blockDim.x)
+    {
+      int index = i + threadIdx.x;
+      if(index == vstart)
+      {
+        panelTau[col] = thisTau;
+        panel[col * m + vstart] = -sign * norm;
+      }
+      else if(index < vend)
+      {
+        panel[col * m + index] /= u;
+      }
+    }
+    //v is now fully computed and stored back to panel
+    //compute z vector using W,Y
+    //each thread will compute one entry in z
+    for(int i = 0; i < m; i += blockDim.x)
+    {
+      int index = i + threadIdx.x;
+      if(index < m)
+      {
+        Scalar zval = 0;
+        if(index >= vstart)
+          zval = -panelTau[col] * panel[col * m + index];
+        //finish computing entry i of z
+        //compute zval as (W * Y^T * v)(i)
+        Scalar wytvi = 0;
+        for(int j = vstart; j < vend; j++)
+        {
+          //need inner product of row i of W and row j of Y
+          //this is (WY^T)(i, j)
+          //use the fact that only the first col+1 columns of W and Y are nonzero
+          Scalar wyt = 0;
+          for(int k = 0; k < col; k++)
+          {
+            Scalar yval = 0;
+            if(j > k)
+              yval = panel[k * m + j];
+            else if(j == k)
+              yval = 1;
+            wyt += W[k * m + i] * yval;
+          }
+          wytvi += wyt * panel[col * m + j];
+        }
+        zval -= panelTau[col] * wytvi;
+        z[index] = zval;
+      }
+    }
+    __syncthreads();  //make z coherent across threads
+    //z is the next column of W
+    for(int i = 0; i < m; i += blockDim.x)
+    {
+      int index = i + threadIdx.x;
+      if(index < m)
+        W[col * m + index] = z[index];
+    }
+    __syncthreads();  //make W coherent
+    //apply reflector in col to remaining columns in panel
+    for(int applyCol = col + 1; applyCol < PC; applyCol++)
+    {
+      //Create a copy of the updating column of A which will
+      //persist while each entry is computed
+      //Only the height range [vstart, vend) is read, used and written back
+      for(int i = vstart; i < m; i += blockDim.x)
+      {
+        int index = i + threadIdx.x;
+        if(index < m)
+          Acol[index] = panel[applyCol * m + index];
+      }
+      __threadfence();
+      for(int applyRow = vstart; applyRow < m; applyRow += blockDim.x)
+      {
+        int index = applyRow + threadIdx.x;
+        if(index < m)
+        {
+          Scalar val = Acol[index];
+          Scalar vIndex;
+          if(index == col)
+            vIndex = 1;
+          else
+            vIndex = panel[col * m + index];
+          for(int i = vstart; i < m; i++)
+          {
+            Scalar vi;
+            if(i == col)
+              vi = 1;
+            else
+              vi = panel[col * m + i];
+            val -= panelTau[col] * vIndex * vi * Acol[i];
+          }
+          panel[applyCol * m + index] = val;
+        }
+      }
+    }
+  }
+  for(int i = 0; i < PC; i += blockDim.x)
+  {
+    if((i + threadIdx.x) + pc < n)
+    {
+      //finalize global tau values for this panel
+      tau[pc + i + threadIdx.x] = panelTau[i + threadIdx.x];
+    }
+  }
+}
+
 //all arrays passed in are preallocated global arrays be be used by all blocks
 //mat is m*n, W is m*PC, z is m, and AcolGlobal is numBlocks * m
 //arrays declared volatile mean entries are not cached,
 //so that a threadfence_*() is sufficient to keep all values coherent
 //(meaning all writes before the fence are reflected in all reads after)
-__global__ void mmqrKernel(volatile Scalar* mat, volatile Scalar* matScratch, Scalar* tau, volatile Scalar* W, volatile Scalar* z, volatile Scalar* AcolGlobal, int m, int n)
+__global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matScratch, Scalar* tau, volatile Scalar* W, volatile Scalar* z, int m, int n, int pc)
 {
   //All dynamic shared memory goes here
   //Is a flat 48 KiB buffer, free for use by each block
   extern __shared__ char sharedBuf[];
+  char* sharedStack = sharedBuf;
   //all blocks need an mx1 vector for scratch space (call it Acol)
   //the proper amount of global memory (for all blocks) is already allocated in AcolGlobal
   Scalar* Acol = AcolGlobal + gridDim.x * m * sizeof(Scalar);
   //determine range of rows "owned" by this thread
-  for(int pc = 0; pc < n; pc += PC)
+  //Allocate some shared arrays that all blocks will use for computations
+  //Note: W is not transposed to coalesce memory accesses
+  //The YW^T entries are computed as inner products of rows of Yblock and Wblock
+  Scalar* Wblock = (Scalar*) sharedStack;
+  sharedStack += PR * PC * sizeof(Scalar);
+  Scalar* Yblock = (Scalar*) sharedStack;
+  sharedStack += PR * PC * sizeof(Scalar);
+  Scalar* Ablock = (Scalar*) sharedStack;
+  sharedStack += PR * PR * sizeof(Scalar);
+  //update trailing columns of A: A = (I + YW^T)A
+  //Each block in the 2D grid is responsible for updating one square region of A (starting at upper-left corner of trailing part)
+  //Each block will read into Wblock/Yblock/Ablock once and write results out to Ascratch once
+  int blockRow = blockIdx.x * (m / PR);
+  int blockCol = pc + PC + blockIdx.y * (n / PR);
+  //first load in Y block
+  //it will stay constant for whole kernel
+  for(int i = 0; i < PR * PC; i += blockDim.x)
   {
-    //useful to think of shared memory buffer as a stack
-    //for simple dynamic allocations
-    char* sharedStack = sharedBuf;
-    Scalar* panel = &mat[pc * m];
-    //Kernel uses 2D grid (to match the way trailing matrix is partitioned among blocks)
-    if(blockIdx.x == 0 && blockIdx.y == 0)
+    int index = i + threadIdx.x;
+    if(index < PR * PC)
     {
-      //"allocate" some shared space for panelTau
-      Scalar* panelTau = (Scalar*) sharedStack;
-      sharedStack += PC * sizeof(Scalar);
-      //zero out W
-      for(int i = 0; i < m * n; i += blockDim.x)
+      int row = index % PR;
+      int col = index / PR;
+      int matRow = blockRow + row;
+      int matCol = blockCol + col;
+      //Y's columns are simply the reflectors stored in mat's subdiagonal.
+      //this reads back the implicit 0/1 entries
+      Scalar yval = 0;
+      if(matRow > matCol)
+        yval = mat[matRow + m * matCol];
+      else if(matRow == matCol)
+        yval = 1;
+      Yblock[row + col * PR] = yval;
+    }
+  }
+  //copy mat values to matScratch where this block's results will be placed
+  for(int i = 0; i < PR * PR; i += blockDim.x)
+  {
+    int index = i + threadIdx.x;
+    if(index < PR * PR)
+    {
+      int row = index % PR;
+      int col = index / PR;
+      int matRow = blockRow + row;
+      int matCol = blockCol + col;
+      if(matRow < m && matCol < n)
       {
-        int index = i + threadIdx.x;
-        if(index < m * n)
-          W[i] = 0;
-      }
-      for(int col = 0; col < PC; col++)
-      {
-        //(middle panels are both top and bottom)
-        int vstart = col + pc;
-        int vend = m;
-        int vlen = vend - vstart;
-        //note: when computing tau/reflectors,
-        //work directly with global mat (only 2 flops per element anyway)
-        //compute the inner product and norm of column
-        Scalar innerProd = 0;
-        {
-          Scalar localInnerProd = 0;
-          //use a cyclic row distribution for perfect coalesced accesses
-          for(int i = vstart; i < vend; i += blockDim.x)
-          {
-            if(i + threadIdx.x < vend)
-            {
-              localInnerProd += panel[i + col * m] * panel[i + col * m];
-            }
-          }
-          //now, sum up the localInnerProds across the whole block
-          //write the partial sums to shared, then do a simple linear reduction
-          Scalar* toReduce = (Scalar*) sharedBuf;
-          toReduce[threadIdx.x] = localInnerProd;
-          __syncthreads();
-          Scalar* finalReduce = ((Scalar*) sharedBuf) + blockDim.x;
-          int numFinal = blockDim.x / 16;
-          if(blockDim.x & 0xF)
-            numFinal++;
-          if(threadIdx.x < numFinal)
-          {
-            localInnerProd = 0;
-            for(int i = 0; i < 16; i++)
-            {
-              int index = i + threadIdx.x * 16;
-              if(index < blockDim.x)
-                localInnerProd += toReduce[index];
-            }
-            finalReduce[threadIdx.x] = localInnerProd;
-          }
-          __syncthreads();
-          //now, every thread sums up finalReduce to get innerProd
-          for(int i = 0; i < numFinal; i++)
-            innerProd += finalReduce[i];
-        }
-        Scalar norm = sqrt(innerProd);
-        Scalar leading = panel[col * m + vstart];
-        Scalar sign = (leading < 0) ? -1.0 : 1.0;
-        Scalar u = leading + sign * norm;
-        Scalar thisTau = sign * u / norm;
-        //compute entire w vector in-place
-        for(int i = vstart; i < vend; i += blockDim.x)
-        {
-          int index = i + threadIdx.x;
-          if(index == vstart)
-          {
-            panelTau[col] = thisTau;
-            panel[col * m + vstart] = -sign * norm;
-          }
-          else if(index < vend)
-          {
-            panel[col * m + index] /= u;
-          }
-        }
-        //v is now fully computed and stored back to panel
-        //compute z vector using W,Y
-        //each thread will compute one entry in z
-        for(int i = 0; i < m; i += blockDim.x)
-        {
-          int index = i + threadIdx.x;
-          if(index < m)
-          {
-            Scalar zval = 0;
-            if(index >= vstart)
-              zval = -panelTau[col] * panel[col * m + index];
-            //finish computing entry i of z
-            //compute zval as (W * Y^T * v)(i)
-            Scalar wytvi = 0;
-            for(int j = vstart; j < vend; j++)
-            {
-              //need inner product of row i of W and row j of Y
-              //this is (WY^T)(i, j)
-              //use the fact that only the first col+1 columns of W and Y are nonzero
-              Scalar wyt = 0;
-              for(int k = 0; k < col; k++)
-              {
-                Scalar yval = 0;
-                if(j > k)
-                  yval = panel[k * m + j];
-                else if(j == k)
-                  yval = 1;
-                wyt += W[k * m + i] * yval;
-              }
-              wytvi += wyt * panel[col * m + j];
-            }
-            zval -= panelTau[col] * wytvi;
-            z[index] = zval;
-          }
-        }
-        __syncthreads();  //make z coherent across threads
-        //z is the next column of W
-        for(int i = 0; i < m; i += blockDim.x)
-        {
-          int index = i + threadIdx.x;
-          if(index < m)
-            W[col * m + index] = z[index];
-        }
-        __syncthreads();  //make W coherent
-        //apply reflector in col to remaining columns in panel
-        for(int applyCol = col + 1; applyCol < PC; applyCol++)
-        {
-          //Create a copy of the updating column of A which will
-          //persist while each entry is computed
-          //Only the height range [vstart, vend) is read, used and written back
-          for(int i = vstart; i < m; i += blockDim.x)
-          {
-            int index = i + threadIdx.x;
-            if(index < m)
-              Acol[index] = panel[applyCol * m + index];
-          }
-          __threadfence();
-          for(int applyRow = vstart; applyRow < m; applyRow += blockDim.x)
-          {
-            int index = applyRow + threadIdx.x;
-            if(index < m)
-            {
-              Scalar val = Acol[index];
-              Scalar vIndex;
-              if(index == col)
-                vIndex = 1;
-              else
-                vIndex = panel[col * m + index];
-              for(int i = vstart; i < m; i++)
-              {
-                Scalar vi;
-                if(i == col)
-                  vi = 1;
-                else
-                  vi = panel[col * m + i];
-                val -= panelTau[col] * vIndex * vi * Acol[i];
-              }
-              panel[applyCol * m + index] = val;
-            }
-          }
-        }
-      }
-      if(threadIdx.x < PC)
-      {
-        //finalize global tau values for this panel
-        tau[pc + threadIdx.x] = panelTau[threadIdx.x];
+        matScratch[matRow + matCol * m] = mat[matRow + matCol * m];
       }
     }
-    //this is necessary to guarantee that Block 0's updates to mat/W are visible to all other blocks
-    __threadfence_system();
-    sharedStack = sharedBuf;
-    //Allocate some shared arrays that all blocks will use for computations
-    Scalar* Wblock = (Scalar*) sharedStack;
-    sharedStack += PR * PC * sizeof(Scalar);
-    Scalar* Yblock = (Scalar*) sharedStack;
-    sharedStack += PR * PC * sizeof(Scalar);
-    Scalar* Ablock = (Scalar*) sharedStack;
-    sharedStack += PR * PR * sizeof(Scalar);
-    //update trailing columns of A: A = (I + YW^T)A
-    //Each block in the 2D grid is responsible for updating one square region of A (starting at upper-left corner of trailing part)
-    //Each block will read into Wblock/Yblock/Ablock once and write results out to Ascratch once
-    int blockRow = blockIdx.x * (m / PR);
-    int blockCol = pc + PC + blockIdx.y * (n / PR);
-    for(int applyCol = pc + PC; applyCol < n; applyCol++)
+  }
+  for(int factorBlock = 0; factorBlock < m; factorBlock += PR)
+  {
+    //load Wblock into shared (from the global W)
+    for(int i = 0; i < PR * PC; i += blockDim.x)
     {
-      Scalar* newAcol = (Scalar*) malloc(m * sizeof(Scalar));
-      //gives perfect minimal memory bandwidth:
-      //each entry read/written once in optimally coalesced accesses
-      //the IA term above is implicit (other term added to this one)
-      for(int i = 0; i < m; i++)
+      int index = i + threadIdx.x;
+      if(index < PR * PC)
       {
-        Acol[i] = mat[i + applyCol * m];
-        newAcol[i] = Acol[i];
+        int row = index % PR;
+        int col = index / PR;
+        //W is stored explicitly in global (also column major), so just read out entries
+        int matRow = blockRow + row;
+        int matCol = blockCol + col;
+        if(matRow < m && matCol < n)
+          Wblock[row + col * PR] = W[row + factorBlock + matCol * m];
       }
-      //now compute YW^T * A[<panel rows>, applyCol] and update newAcol
-      for(int i = 0; i < m; i++)
-      {
-        Scalar newAval = 0;
-        for(int j = 0; j < m; j++)
-        {
-          //need inner product of row i of Y and row j of W
-          //generate entry (Y*W^T)(i, j)
-          Scalar ywt = 0;
-          for(int k = 0; k < PC; k++)
-          {
-            //yval = Y(i, k) is an element of v reflectors
-            Scalar yval = 0;
-            if(i > k)
-              yval = panel[k * m + j];
-            else if(i == k)
-              yval = 1;
-            ywt += yval * W[k * m + j];
-          }
-          //multiply that by entry j of A
-          newAval += ywt * Acol[j];
-        }
-        newAcol[i] += newAval;
-      }
-      //write back newAcol
-      for(int i = 0; i < m; i++)
-      {
-        mat[i + applyCol * m] = newAcol[i];
-      }
-      free(Acol);
-      free(newAcol);
     }
-    //wait for all writes of all blocks (to trailing entries of A) to complete
-    //this kind of fence is expensive but is only way to synchronize across blocks
-    __threadfence_system();
+    //load block from A
+    for(int i = 0; i < PR * PR; i += blockDim.x)
+    {
+      int index = i + threadIdx.x;
+      if(index < PR * PR)
+      {
+        int row = index % PR;
+        int col = index / PR;
+        //Y's columns are simply the reflectors stored in mat's subdiagonal
+        int matRow = blockRow + row;
+        int matCol = blockCol + col;
+        Ablock[row + col * PR] = mat[row + (factorBlock + col) * m];
+      }
+    }
+    //compute all the updates in matScratch (one per thread until done)
+    for(int i = 0; i < PR * PR; i += blockDim.x)
+    {
+      int index = i + threadIdx.x;
+      if(index < PR * PR)
+      {
+        int row = index % PR;
+        int col = index / PR;
+        int 
+        if(row < m && col < n)
+        {
+          //need to compute (Wblock * Yblock) * Ablock, then add entries of product to matScratch
+        }
+      }
+    }
+    //now compute YW^T * A[<panel rows>, applyCol] and update newAcol
+    for(int i = 0; i < m; i++)
+    {
+      Scalar newAval = 0;
+      for(int j = 0; j < m; j++)
+      {
+        //need inner product of row i of Y and row j of W
+        //generate entry (Y*W^T)(i, j)
+        Scalar ywt = 0;
+        for(int k = 0; k < PC; k++)
+        {
+          //yval = Y(i, k) is an element of v reflectors
+          Scalar yval = 0;
+          if(i > k)
+            yval = panel[k * m + j];
+          else if(i == k)
+            yval = 1;
+          ywt += yval * W[k * m + j];
+        }
+        //multiply that by entry j of A
+        newAval += ywt * Acol[j];
+      }
+      newAcol[i] += newAval;
+    }
+    //write back newAcol
+    for(int i = 0; i < m; i++)
+    {
+      mat[i + applyCol * m] = newAcol[i];
+    }
   }
 }
 
