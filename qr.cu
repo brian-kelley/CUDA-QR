@@ -54,11 +54,10 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
     if(index < m * n)
       W[i] = 0;
   }
-  for(int col = 0; col < PC; col++)
+  for(int col = 0; col < PC && pc + col < n; col++)
   {
     //(middle panels are both top and bottom)
     int vstart = col + pc;
-    int vend = m;
     //note: when computing tau/reflectors,
     //work directly with global mat (only 2 flops per element anyway)
     //compute the inner product and norm of column
@@ -66,11 +65,12 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
     {
       Scalar localInnerProd = 0;
       //use a cyclic row distribution for perfect coalesced accesses
-      for(int i = vstart; i < vend; i += blockDim.x)
+      for(int i = vstart; i < m; i += blockDim.x)
       {
-        if(i + threadIdx.x < vend)
+        int index = i + threadIdx.x;
+        if(index < m)
         {
-          localInnerProd += panel[i + col * m] * panel[i + col * m];
+          localInnerProd += panel[index + col * m] * panel[index + col * m];
         }
       }
       //now, sum up the localInnerProds across the whole block
@@ -104,7 +104,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
     Scalar u = leading + sign * norm;
     Scalar thisTau = sign * u / norm;
     //compute entire w vector in-place
-    for(int i = vstart; i < vend; i += blockDim.x)
+    for(int i = vstart; i < m; i += blockDim.x)
     {
       int index = i + threadIdx.x;
       if(index == vstart)
@@ -112,7 +112,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
         panelTau[col] = thisTau;
         panel[col * m + vstart] = -sign * norm;
       }
-      else if(index < vend)
+      else if(index < m)
       {
         panel[col * m + index] /= u;
       }
@@ -131,7 +131,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
         //finish computing entry i of z
         //compute zval as (W * Y^T * v)(i)
         Scalar wytvi = 0;
-        for(int j = vstart; j < vend; j++)
+        for(int j = vstart; j < m; j++)
         {
           //need inner product of row i of W and row j of Y
           //this is (WY^T)(i, j)
@@ -166,7 +166,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
     {
       //Create a copy of the updating column of A which will
       //persist while each entry is computed
-      //Only the height range [vstart, vend) is read, used and written back
+      //Only the height range [vstart, m) is read, used and written back
       for(int i = vstart; i < m; i += blockDim.x)
       {
         int index = i + threadIdx.x;
@@ -531,7 +531,7 @@ int main()
     puts("Only float (32-bit) and double (64-bit) reals are supported scalar types");
     exit(1);
   }
-  int m = PC * 2;
+  int m = PC;
   int n = PC;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
