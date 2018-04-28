@@ -11,7 +11,7 @@
 
 //PR is how big the square trailing update block matrix should be (per CUDA block)
 //(PR^2 + 2 * PR * PC) * sizeof(Scalar) should fit in 48 KiB
-#define PR 16
+#define PR 64
 //PC is how many columns of A get grouped into one compressed block Householder transform
 #define PC 16
 
@@ -38,7 +38,7 @@ void printMat(Scalar* mat, int m, int n)
 //Do block Householder factorization of the first PC columns of mat, starting at pc
 //this kernel is only meant to be run on a single block with as many threads as possible
 //this is because it contains many synchronization points
-__global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volatile Scalar* W, volatile Scalar* z, volatile Scalar* Acol, int m, int n, int pc)
+__global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volatile Scalar* W, volatile Scalar* Acol, int m, int n, int pc)
 {
   //useful to think of shared memory buffer as a stack
   //for simple dynamic allocations
@@ -456,20 +456,21 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   int threadsPerBlock = m < maxThreads ? m : maxThreads;
   Scalar* W;
   Scalar* matScratch;
-  Scalar* z; 
   Scalar* Acol;
   cudaMalloc((void**) &W, m * PC * sizeof(Scalar));
-  cudaMalloc((void**) &z, m * sizeof(Scalar));
   cudaMalloc((void**) &Acol, m * sizeof(Scalar));
   cudaMalloc((void**) &matScratch, m * n * sizeof(Scalar));
   for(int pc = 0; pc < n; pc += PC)
   {
-    panelHouseholderKernel<<<1, threadsPerBlock, shmem>>>(Adev, tauDev, W, z, Acol, m, n, pc);
-    Scalar* Whost = (Scalar*) malloc(PC * m * sizeof(Scalar));
-    cudaMemcpy(Whost, W, m * PC * sizeof(Scalar), cudaMemcpyDeviceToHost);
-    puts("W matrix:");
-    printMat(Whost, m, PC);
-    free(Whost);
+    //know exactly how much shared memory each kernel needs (at runtime)
+    int kernel1shared = (threadsPerBlock + 16) * sizeof(Scalar);
+    assert(kernel1shared <= shmem);
+    panelHouseholderKernel<<<1, threadsPerBlock, kernel1shared>>>(Adev, tauDev, W, Acol, m, n, pc);
+    //Scalar* Whost = (Scalar*) malloc(PC * m * sizeof(Scalar));
+    //cudaMemcpy(Whost, W, m * PC * sizeof(Scalar), cudaMemcpyDeviceToHost);
+    //puts("W matrix:");
+    //printMat(Whost, m, PC);
+    //free(Whost);
     int changedColumns = PC;
     if(changedColumns + pc > n)
       changedColumns = n - pc;
@@ -486,14 +487,15 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         blocksY++;
       dim3 gridSize(blocksX, blocksY);
       printf("Launching block update kernel with %dx%d grid, updating %dx%d region\n", gridSize.x, gridSize.y, m - pc, n - pc - PC);
-      trailingUpdateKernel<<<gridSize, maxThreads, shmem>>>(Adev, matScratch, tau, W, m, n, pc);
+      int kernel2shared = 2 * PR * PC + PR * PR;
+      assert(kernel2shared <= shmem);
+      trailingUpdateKernel<<<gridSize, maxThreads, kernel2shared>>>(Adev, matScratch, tau, W, m, n, pc);
       //copy trailing columns of matScratch (just updated) back to Adev
       cudaMemcpy(Adev + m * (pc + PC), matScratch + m * (pc + PC), m * (n - pc - PC) * sizeof(Scalar), cudaMemcpyDeviceToDevice);
     }
   }
   cudaFree(matScratch);
   cudaFree(Acol);
-  cudaFree(z);
   cudaFree(W);
   //retrieve A and tau
   HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
@@ -528,8 +530,8 @@ int main()
     puts("Only float (32-bit) and double (64-bit) reals are supported scalar types");
     exit(1);
   }
-  int m = PC;
-  int n = PC;
+  int m = 1024;
+  int n = 1024;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
@@ -541,8 +543,8 @@ int main()
     A[i] = (Scalar) rand() / RAND_MAX;
     RV[i] = A[i];
   }
-  puts("A matrix:\n");
-  printMat(A, m, n);
+  //puts("A matrix:\n");
+  //printMat(A, m, n);
   int trials = 1;
   double elapsed = 0;
   struct timeval currentTime;
@@ -562,6 +564,7 @@ int main()
   printf("Ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, elapsed / trials, trials);
   //printf("A raw storage after QR:\n");
   //printMat(RV, m, n);
+  /*
   Scalar* Q = (Scalar*) malloc(m * m * sizeof(Scalar));
   Scalar* R = (Scalar*) malloc(m * n * sizeof(Scalar));
   explicitQR(RV, tau, Q, R, m, n);
@@ -582,14 +585,15 @@ int main()
     QRmA[i] = QR[i] - A[i];
     errNorm += QRmA[i] * QRmA[i];
   }
-  printMat(QRmA, m, n);
+  //printMat(QRmA, m, n);
   free(QRmA);
   errNorm = sqrt(errNorm);
   printf("L2 norm of residual QR-A: %.9g\n", errNorm);
-  free(QR);
-  free(RV);
   free(R);
   free(Q);
+  free(QR);
+  */
+  free(RV);
   free(A);
   return 0;
 }
