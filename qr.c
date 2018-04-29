@@ -44,15 +44,22 @@ void printMat(Scalar* mat, int m, int n)
 //integer division a/b, rounded up
 #define ceildiv(a, b) ((a) / (b) + ((a) % (b) != 0))
 
+void getPanelDims(int m, int n, int* rowPanels, int* colPanels)
+{
+  *colPanels = ceildiv(n, PC);
+  *rowPanels = 1;
+  if(m > PR)
+    *rowPanels += ceildiv(m - PR, PR - PC);
+}
+
 void mmqr(Scalar* mat, Scalar** tau, int m, int n)
 {
   printf("Computing QR factorization of %d by %d matrix...\n\n", m, n);
-  int colPanels = ceildiv(n, PC);
-  int rowPanels = 1;
-  if(m > PR)
-    rowPanels += ceildiv(m - PR, PR - PC);
+  int rowPanels, colPanels;
+  getPanelDims(m, n, &rowPanels, &colPanels);
   //allocate space for one tau value per col in each panel
   *tau = malloc(rowPanels * colPanels * PC * sizeof(Scalar));
+  memset(*tau, 0, rowPanels * colPanels * PC * sizeof(Scalar));
   printf("Matrix is %d by %d panels (cols, rows).\n", colPanels, rowPanels);
   //iterate over all subdiagonal panels
   //first left to right
@@ -322,10 +329,8 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
   //note: this is very expensive to do naively on host
   //first, get I(m) into Q
   identity(Q, m);
-  int colPanels = ceildiv(n, PC);
-  int rowPanels = 1;
-  if(m > PR)
-    rowPanels += ceildiv(m - PR, PR - PC);
+  int rowPanels, colPanels;
+  getPanelDims(m, n, &rowPanels, &colPanels);
   int pcCount = 0;
   printf("Matrix is %d by %d panels.\n", rowPanels, colPanels);
   for(int pc = 0; pc < n; pc += PC)
@@ -383,12 +388,14 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
           else
             v[i] = A[(pc + col) * m + i];
         }
+        /*
         printf("v:\n");
         for(int i = 0; i < m; i++)
         {
           printf("%f ", v[i]);
         }
         putchar('\n');
+        */
         //create H matrix for this reflector
         Scalar* H = malloc(m * m * sizeof(Scalar));
         identity(H, m);
@@ -438,8 +445,8 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 
 int main()
 {
-  int m = PR;
-  int n = PC;
+  int m = PR + (PR - PC);
+  int n = PC * 2;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* RV = malloc(m * n * sizeof(Scalar));
@@ -455,10 +462,16 @@ int main()
   mmqr(RV, &tau, m, n);
   printf("A raw storage after QR:\n");
   printMat(RV, m, n);
-  printf("tau values after QR:\n");
-  for(int i = 0; i < n; i++)
+  int rowPanels, colPanels;
+  getPanelDims(m, n, &rowPanels, &colPanels);
+  printf("tau values after QR (grid corresponding to columns within panels):\n");
+  for(int j = 0; j < rowPanels; j++)
   {
-    printf("%f ", tau[i]);
+    for(int i = 0; i < colPanels * PC; i++)
+    {
+      printf("%9f ", tau[i * rowPanels + j]);
+    }
+    putchar('\n');
   }
   putchar('\n');
   Scalar* Q = malloc(m * m * sizeof(Scalar));
