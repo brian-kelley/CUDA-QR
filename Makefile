@@ -1,4 +1,4 @@
-all: host device
+all: host
 
 device:
 	nvcc -arch=compute_35 -code=sm_35 -g -G -ccbin=icc qr.cu -o qr_device.exe

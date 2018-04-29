@@ -47,11 +47,13 @@ void printMat(Scalar* mat, int m, int n)
 void mmqr(Scalar* mat, Scalar** tau, int m, int n)
 {
   printf("Computing QR factorization of %d by %d matrix...\n\n", m, n);
-  int panelsX = ceildiv(n, PC);
-  int panelsY = 1;
+  int colPanels = ceildiv(n, PC);
+  int rowPanels = 1;
   if(m > PR)
-    panelsY += ceildiv(m - PR, PR - PC);
-  printf("Matrix is %d by %d panels.\n", panelsY, panelsX);
+    rowPanels += ceildiv(m - PR, PR - PC);
+  //allocate space for one tau value per col in each panel
+  *tau = malloc(rowPanels * colPanels * PC * sizeof(Scalar));
+  printf("Matrix is %d by %d panels (cols, rows).\n", colPanels, rowPanels);
   //iterate over all subdiagonal panels
   //first left to right
   //pcCount gives col index of panel (for tau)
@@ -63,6 +65,7 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
     int prCount = 0;
     for(int pr = m - PR; (pr + PR > pc) && pr >= 0; pr -= (PR-PC))
     {
+      printf("Processing panel at (%d, %d)\n", pr, pc);
       //load panel into shared memory, one column at a time
       //Note that panel is column major
       Scalar (*panel)[PR] = malloc(PC * PR * sizeof(Scalar));
@@ -127,6 +130,7 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
           vstart = col;
           vend = PR - PC + col + 1;
         }
+        printf("Col %d reflector begins at row %d and ends at %d\n", col, vstart, vend);
         int vlen = vend - vstart;
         Scalar innerProd = 0;
         for(int row = vstart; row < vend; row++)
@@ -195,7 +199,6 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
           Y[col][i + vstart] = v[i];
         }
         //apply reflector in col to remaining columns in panel
-        //TODO: do in parallel
         for(int applyCol = col + 1; applyCol < PC; applyCol++)
         {
           //Create a copy of the updating column of A which can
@@ -272,7 +275,8 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
       }
       for(int i = 0; i < PC; i++)
       {
-        tau[i + pc] = panelTau[i];
+        (*tau)[(rowPanels * pcCount + prCount) * PC + i] = panelTau[i];
+        printf("tau(%d) in panel %d, %d is %f\n", i, pr, pc, panelTau[i]);
       }
       free(Y);
       free(W);
@@ -301,7 +305,8 @@ void identity(Scalar* A, int m)
 //All matrices are column-major
 void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
 {
-  //first, R is simpy the diagonal and upper triangular parts of A
+  puts("******\n\nCOMPUTING EXPLICIT QR REPRESENTATION*****\n\n");
+  //first, R is simply the upper triangular part of A (including diagonal)
   for(int i = 0; i < n; i++)
   {
     for(int j = 0; j < m; j++)
@@ -312,42 +317,101 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
         R[i * m + j] = 0;
     }
   }
-  //next, Q is the result of applying each Householder reflector to I(m)
+  //next, Q is the result of applying each Householder reflector
+  //(stored in subdiagonals) to I(m)
   //note: this is very expensive to do naively on host
   //first, get I(m) into Q
   identity(Q, m);
-  for(int i = 0; i < n; i++)
+  int colPanels = ceildiv(n, PC);
+  int rowPanels = 1;
+  if(m > PR)
+    rowPanels += ceildiv(m - PR, PR - PC);
+  int pcCount = 0;
+  printf("Matrix is %d by %d panels.\n", rowPanels, colPanels);
+  for(int pc = 0; pc < n; pc += PC)
   {
-    Scalar* v = malloc(m * sizeof(Scalar));
-    for(int j = 0; j < i; j++)
+    //then bottom to top, sliding panel up by R-C each iteration
+    //prCount gives row index of panel (bottom is 0)
+    int prCount = 0;
+    for(int pr = m - PR; (pr + PR > pc) && pr >= 0; pr -= (PR-PC))
     {
-      v[j] = 0;
-    }
-    v[i] = 1;
-    for(int j = i + 1; j < m; j++)
-    {
-      v[j] = A[i * m + j];
-    }
-    Scalar* H = malloc(m * m * sizeof(Scalar));
-    identity(H, m);
-    //j is column of H being updated
-    for(int j = 0; j < m; j++)
-    {
-      //k is row
-      for(int k = 0; k < m; k++)
+      //is the panel at the bottom of A?
+      bool bottomPanel = pr == m - PR;
+      //does col 0 of panel cross A's diagonal?
+      bool topPanel = pr <= pc;
+      for(int col = 0; col < PC && col + pc < n; col++)
       {
-        H[k + j * m] -= tau[i] * v[k] * v[j];
+        printf("Applying reflector: col %d of panel %d, %d\n", col, pr, pc);
+        Scalar tauVal = tau[(rowPanels * pcCount + prCount) * PC + col];
+        printf("Tau for this column: %f\n", tauVal);
+        //update each trailing column (pr:pr+R, pc+C:N):
+        //for each column, compute HH reflectors
+        //(middle panels are both top and bottom)
+        int vstart;
+        int vend;
+        if(topPanel && bottomPanel)
+        {
+          vstart = pc - pr + col;
+          vend = PR;
+        }
+        else if(!topPanel && bottomPanel)
+        {
+          vstart = col;
+          vend = PR;
+        }
+        else if(topPanel && !bottomPanel)
+        {
+          //vstart needs to be at or below A's diagonal, even if
+          //panel boundaries extends above it
+          vstart = pc - pr + col;
+          vend = PR - PC + col + 1;
+        }
+        else
+        {
+          //neither top nor bottom panel
+          vstart = col;
+          vend = PR - PC + col + 1;
+        }
+        Scalar* v = malloc(m * sizeof(Scalar));
+        //read v from subdiagonal of A
+        for(int i = 0; i < m; i++)
+        {
+          if(i < pr + vstart || i >= pr + vend)
+            v[i] = 0;
+          else if(i == pr + vstart)
+            v[i] = 1;
+          else
+            v[i] = A[(pc + col) * m + i];
+        }
+        printf("v:\n");
+        for(int i = 0; i < m; i++)
+        {
+          printf("%f ", v[i]);
+        }
+        putchar('\n');
+        //create H matrix for this reflector
+        Scalar* H = malloc(m * m * sizeof(Scalar));
+        identity(H, m);
+        for(int j = 0; j < m; j++)
+        {
+          for(int k = 0; k < m; k++)
+          {
+            H[k + j * m] -= tauVal * v[k] * v[j];
+          }
+        }
+        //dgemm can't multiply Q by H in-place,
+        //so make a persistent copy of Q
+        Scalar* prevQ = malloc(m * m * sizeof(Scalar));
+        for(int j = 0; j < m * m; j++)
+          prevQ[j] = Q[j];
+        dgemm(prevQ, H, Q, m, m, m);
+        free(prevQ);
+        free(v);
+        free(H);
       }
+      prCount++;
     }
-    //dgemm can't multiply Q by H in-place,
-    //so make a persistent copy of Q
-    Scalar* prevQ = malloc(m * m * sizeof(Scalar));
-    for(int j = 0; j < m * m; j++)
-      prevQ[j] = Q[j];
-    dgemm(prevQ, H, Q, m, m, m);
-    free(prevQ);
-    free(H);
-    free(v);
+    pcCount++;
   }
 }
 
@@ -375,11 +439,10 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 int main()
 {
   int m = PR;
-  int n = PC * 2;
+  int n = PC;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* RV = malloc(m * n * sizeof(Scalar));
-  Scalar* tau = malloc(n * sizeof(Scalar));
   srand(12);
   //initialize A randomly
   for(int i = 0; i < m * n; i++)
@@ -388,17 +451,16 @@ int main()
     RV[i] = A[i];
   }
   printMat(A, m, n);
-  mmqr(RV, tau, m, n);
-  //printf("A raw storage after QR:\n");
-  //printMat(RV, m, n);
-  /*
+  Scalar* tau = NULL;
+  mmqr(RV, &tau, m, n);
+  printf("A raw storage after QR:\n");
+  printMat(RV, m, n);
   printf("tau values after QR:\n");
   for(int i = 0; i < n; i++)
   {
     printf("%f ", tau[i]);
   }
   putchar('\n');
-  */
   Scalar* Q = malloc(m * m * sizeof(Scalar));
   Scalar* R = malloc(m * n * sizeof(Scalar));
   explicitQR(RV, tau, Q, R, m, n);
@@ -409,9 +471,9 @@ int main()
   //now compute Q*R explicitly and compare to A
   Scalar* QR = malloc(m * n * sizeof(Scalar));
   dgemm(Q, R, QR, m, m, n);
-  //printf("QR:\n");
-  //printMat(QR, m, n);
-  //printf("QR-A (should be 0):\n");
+  printf("QR:\n");
+  printMat(QR, m, n);
+  printf("QR-A (should be 0):\n");
   Scalar* QRmA = malloc(m * n * sizeof(Scalar));
   Scalar errNorm = 0;
   for(int i = 0; i < m * n; i++)
@@ -419,7 +481,7 @@ int main()
     QRmA[i] = QR[i] - A[i];
     errNorm += QRmA[i] * QRmA[i];
   }
-  //printMat(QRmA, m, n);
+  printMat(QRmA, m, n);
   free(QRmA);
   errNorm = sqrt(errNorm);
   printf("L2 norm of residual QR-A: %.9g\n", errNorm);
