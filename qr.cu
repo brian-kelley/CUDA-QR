@@ -11,7 +11,7 @@
 
 //PR is how big the square trailing update block matrix should be (per CUDA block)
 //(PR^2 + 2 * PR * PC) * sizeof(Scalar) should fit in 48 KiB
-#define PR 64
+#define PR 16
 //PC is how many columns of A get grouped into one compressed block Householder transform
 #define PC 16
 
@@ -43,9 +43,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
   //useful to think of shared memory buffer as a stack
   //for simple dynamic allocations
   volatile Scalar* panel = &mat[pc * m];
-  extern __shared__ char sharedBuf[];
-  char* sharedStack = sharedBuf;
-  sharedStack += PC * sizeof(Scalar);
+  extern __shared__ Scalar sharedBuf[];
   //zero out W
   for(int i = 0; i < m * PC; i += blockDim.x)
   {
@@ -74,16 +72,15 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
       }
       //now, sum up the localInnerProds across the whole block
       //write the partial sums to shared, then do a simple linear reduction
-      Scalar* toReduce = (Scalar*) sharedStack;
-      sharedStack += blockDim.x * sizeof(Scalar);
+      Scalar* toReduce = sharedBuf;
       toReduce[threadIdx.x] = localInnerProd;
-      __threadfence_block();
-      Scalar* finalReduce = (Scalar*) sharedStack;
+      __threadfence();
+      Scalar* finalReduce = &toReduce[blockDim.x];
       int numFinal = 16;
       if(threadIdx.x < numFinal)
       {
         localInnerProd = 0;
-        for(int i = 0; i < blockDim.x; i += 16)
+        for(int i = 0; i < blockDim.x; i += numFinal)
         {
           int index = i + threadIdx.x;
           if(index < blockDim.x)
@@ -91,7 +88,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
         }
         finalReduce[threadIdx.x] = localInnerProd;
       }
-      __threadfence_block();
+      __threadfence();
       //now, every thread sums up finalReduce to get innerProd
       for(int i = 0; i < 16; i++)
         innerProd += finalReduce[i];
@@ -213,18 +210,14 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
 {
   //All dynamic shared memory goes here
   //Is a flat 48 KiB buffer, free for use by each block
-  extern __shared__ char sharedBuf[];
-  char* sharedStack = sharedBuf;
+  extern __shared__ Scalar sharedBuf[];
   //determine range of rows "owned" by this thread
   //Allocate some shared arrays that all blocks will use for computations
   //Note: W is not transposed to coalesce memory accesses
   //The YW^T entries are computed as inner products of rows of Yblock and Wblock
-  Scalar* Wblock = (Scalar*) sharedStack;
-  sharedStack += PR * PC * sizeof(Scalar);
-  Scalar* Yblock = (Scalar*) sharedStack;
-  sharedStack += PR * PC * sizeof(Scalar);
-  Scalar* Ablock = (Scalar*) sharedStack;
-  sharedStack += PR * PR * sizeof(Scalar);
+  Scalar* Wblock = &sharedBuf[0];
+  Scalar* Yblock = &Wblock[PR * PC];
+  Scalar* Ablock = &Yblock[PR * PC];
   //update trailing columns of A: A = (I + YW^T)A
   //Each block in the 2D grid is responsible for updating one square region of A (starting at upper-left corner of trailing part)
   //Each block will read into Wblock/Yblock/Ablock once and write results out to Ascratch once
@@ -465,7 +458,10 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
     //know exactly how much shared memory each kernel needs (at runtime)
     int kernel1shared = (threadsPerBlock + 16) * sizeof(Scalar);
     assert(kernel1shared <= shmem);
+    printf("Kernel 1 (panel factor) needs %d bytes shared\n", kernel1shared);
+    printf("Launching kernel 1...");
     panelHouseholderKernel<<<1, threadsPerBlock, kernel1shared>>>(Adev, tauDev, W, Acol, m, n, pc);
+    puts("done");
     //Scalar* Whost = (Scalar*) malloc(PC * m * sizeof(Scalar));
     //cudaMemcpy(Whost, W, m * PC * sizeof(Scalar), cudaMemcpyDeviceToHost);
     //puts("W matrix:");
@@ -489,7 +485,10 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       printf("Launching block update kernel with %dx%d grid, updating %dx%d region\n", gridSize.x, gridSize.y, m - pc, n - pc - PC);
       int kernel2shared = 2 * PR * PC + PR * PR;
       assert(kernel2shared <= shmem);
+    printf("Kernel 2 (trailing update) needs %d bytes shared\n", kernel2shared);
+    printf("Launching kernel 2...");
       trailingUpdateKernel<<<gridSize, maxThreads, kernel2shared>>>(Adev, matScratch, tau, W, m, n, pc);
+      puts("done");
       //copy trailing columns of matScratch (just updated) back to Adev
       cudaMemcpy(Adev + m * (pc + PC), matScratch + m * (pc + PC), m * (n - pc - PC) * sizeof(Scalar), cudaMemcpyDeviceToDevice);
     }
@@ -530,8 +529,8 @@ int main()
     puts("Only float (32-bit) and double (64-bit) reals are supported scalar types");
     exit(1);
   }
-  int m = 1024;
-  int n = 1024;
+  int m = 32;
+  int n = 32;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
