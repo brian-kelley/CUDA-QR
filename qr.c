@@ -9,8 +9,8 @@
 //Scalar may be either float or double
 //(2RC + C) * sizeof(Scalar) must fit in 48 KiB
 #define Scalar float
-#define PR 4
-#define PC 2
+#define PR 8
+#define PC 4
 
 void printMat(Scalar* mat, int m, int n);
 void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n);
@@ -38,7 +38,7 @@ void printMat(Scalar* mat, int m, int n)
 //panelsY is how many panels are needed vertically, taking into
 //account overlap
 //
-//tau is allocated to be panelsX * n, row-major (tau values of one panel contiguous)
+//tau is allocated to be panelsX * n, col-major (tau values of one panel contiguous)
 //technically tau array is lower triangular so this could be compressed, but don't for simplicity
 
 //integer division a/b, rounded up

@@ -35,168 +35,190 @@ void printMat(Scalar* mat, int m, int n)
   putchar('\n');
 }
 
+void getPanelDims(int m, int n, int* rowPanels, int* colPanels)
+{
+  *colPanels = ceildiv(n, PC);
+  *rowPanels = 1;
+  if(m > PR)
+    *rowPanels += ceildiv(m - PR, PR - PC);
+}
+
 //Do block Householder factorization of the first PC columns of mat, starting at pc
 //this kernel is only meant to be run on a single block with as many threads as possible
 //this is because it contains many synchronization points
-__global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volatile Scalar* W, volatile Scalar* Acol, int m, int n, int pc)
+__global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int m, int n, int pc, int rowPanels)
 {
   //useful to think of shared memory buffer as a stack
   //for simple dynamic allocations
-  volatile Scalar* panel = &mat[pc * m];
   extern __shared__ Scalar sharedBuf[];
-  //zero out W
-  for(int i = 0; i < m * PC; i += blockDim.x)
+  //Preallocate all shared arrays here
+  Scalar* toReduce = sharedBuf;
+  Scalar* finalReduce = sharedBuf + blockDim.x;
+  int finalReduceNum = 16;
+  Scalar* panel = finalReduce + finalReduceNum;
+  Scalar* Wshared = panel + (PR * PC);
+  Scalar* Acol = 
+  for(int pr = m - PR; (pr + PR > pc) && pr >= 0; pr -= (PR-PC))
   {
-    int index = i + threadIdx.x;
-    if(index < m * PC)
-      W[index] = 0;
-  }
-  for(int col = 0; col < PC && pc + col < n; col++)
-  {
-    //(middle panels are both top and bottom)
-    int vstart = pc + col;
-    //note: when computing tau/reflectors,
-    //work directly with global mat (only 2 flops per element anyway)
-    //compute the inner product and norm of column
-    Scalar innerProd = 0;
+    //zero out W
+    for(int i = 0; i < m * PC; i += blockDim.x)
     {
-      Scalar localInnerProd = 0;
-      //use a cyclic row distribution for perfect coalesced accesses
-      for(int i = vstart; i < m; i += blockDim.x)
+      int index = i + threadIdx.x;
+      if(index < m * PC)
+        W[index] = 0;
+    }
+    //load panel into shared
+    for(int i = 0; i < PR * PC; i += blockDim.x)
+    {
+      if(i + threadIdx.x < PR * PC)
       {
-        int index = i + threadIdx.x;
-        if(index < m)
-        {
-          localInnerProd += panel[index + col * m] * panel[index + col * m];
-        }
+        int col = i / PR;
+        int row = i % PR;
+        panel[row + col * PR] = mat[(pc + col) * m + pr + row];
       }
-      //now, sum up the localInnerProds across the whole block
-      //write the partial sums to shared, then do a simple linear reduction
-      Scalar* toReduce = sharedBuf;
-      toReduce[threadIdx.x] = localInnerProd;
-      __threadfence();
-      Scalar* finalReduce = &toReduce[blockDim.x];
-      int numFinal = 16;
-      if(threadIdx.x < numFinal)
+    }
+    __syncthreads();
+    //this is a broadcast access, fast:
+    Scalar leading = panel[col * PR + vstart];
+    for(int col = 0; col < PC && pc + col < n; col++)
+    {
+      //note: when computing tau/reflectors,
+      //work directly with global mat (only 2 flops per element anyway)
+      //compute the inner product and norm of column
+      Scalar innerProd = 0;
       {
-        localInnerProd = 0;
-        for(int i = 0; i < blockDim.x; i += numFinal)
+        Scalar localInnerProd = 0;
+        //use a cyclic row distribution for perfect coalesced accesses
+        for(int i = vstart; i < m; i += blockDim.x)
         {
           int index = i + threadIdx.x;
-          if(index < blockDim.x)
-            localInnerProd += toReduce[index];
-        }
-        finalReduce[threadIdx.x] = localInnerProd;
-      }
-      __threadfence();
-      //now, every thread sums up finalReduce to get innerProd
-      for(int i = 0; i < 16; i++)
-        innerProd += finalReduce[i];
-    }
-    Scalar norm = sqrt(innerProd);
-    Scalar leading = panel[col * m + vstart];
-    __syncthreads();
-    Scalar sign = (leading < 0) ? -1.0 : 1.0;
-    Scalar u = leading + sign * norm;
-    Scalar thisTau = sign * u / norm;
-    //compute entire w vector in-place, storing it back to A subdiag
-    for(int i = vstart; i < m; i += blockDim.x)
-    {
-      int index = i + threadIdx.x;
-      if(index == vstart)
-      {
-        //thread 0 uniquely responsible for setting R diagonal entry and tau
-        tau[pc + col] = thisTau;
-        panel[col * m + vstart] = -sign * norm;
-      }
-      else if(index < m)
-      {
-        panel[col * m + index] /= u;
-      }
-    }
-    __threadfence_block();
-    //v is now fully computed and stored back to panel
-    //compute z vector using W,Y
-    //each thread will compute one entry in z
-    for(int i = 0; i < m; i += blockDim.x)
-    {
-      int index = i + threadIdx.x;
-      if(index < m)
-      {
-        Scalar zval = 0;
-        //set zval to v[index]
-        if(index == vstart)
-          zval = -thisTau;
-        else if(index > vstart)
-          zval = -thisTau * panel[col * m + index];
-        //finish computing entry i of z
-        //compute zval as (W * Y^T * v)(i)
-        Scalar wytvi = 0;
-        for(int j = vstart; j < m; j++)
-        {
-          //need inner product of row i of W and row j of Y
-          //this is (WY^T)(i, j)
-          //use the fact that only the first col+1 columns of W and Y are nonzero
-          Scalar wyt = 0;
-          for(int k = 0; k < col; k++)
+          if(index < m)
           {
-            Scalar yval = 0;
-            int kColVstart = pc + k;
-            if(j > kColVstart)
-              yval = panel[k * m + j];
-            else if(j == kColVstart)
-              yval = 1;
-            wyt += W[k * m + index] * yval;
+            localInnerProd += panel[index + col * m] * panel[index + col * m];
           }
-          Scalar vval = 0;
-          if(j > vstart)
-            vval = panel[col * m + j];
-          else if(j == vstart)
-            vval = 1;
-          wytvi += wyt * vval;
         }
-        zval -= thisTau * wytvi;
-        W[col * m + index] = zval;
+        //now, sum up the localInnerProds across the whole block
+        //write the partial sums to shared, then do a simple linear reduction
+        toReduce[threadIdx.x] = localInnerProd;
+        __threadfence();
+        if(threadIdx.x < finalReduceNum)
+        {
+          localInnerProd = 0;
+          for(int i = 0; i < blockDim.x; i += numFinal)
+          {
+            int index = i + threadIdx.x;
+            if(index < blockDim.x)
+              localInnerProd += toReduce[index];
+          }
+          finalReduce[threadIdx.x] = localInnerProd;
+        }
+        __threadfence();
+        //now, every thread sums up finalReduce to get innerProd
+        for(int i = 0; i < finalReduceNum; i++)
+          innerProd += finalReduce[i];
       }
-    }
-    __threadfence_block();
-    //apply reflector in col to remaining columns in panel
-    for(int applyCol = col + 1; applyCol < PC && pc + applyCol < n; applyCol++)
-    {
-      //Create a copy of the updating column of A which will
-      //persist while each entry is computed
-      //Only the height range [vstart, m) is read, used and written back
-      for(int i = vstart; i < m; i += blockDim.x)
+      Scalar norm = sqrt(innerProd);
+      Scalar sign = (leading < 0) ? -1.0 : 1.0;
+      Scalar u = leading + sign * norm;
+      Scalar thisTau = sign * u / norm;
+      //compute entire w vector in-place, storing it back to A subdiag
+      for(int i = vstart; i < vend; i += blockDim.x)
       {
         int index = i + threadIdx.x;
-        if(index < m)
-          Acol[index] = panel[applyCol * m + index];
-      }
-      __syncthreads();
-      for(int applyRow = vstart; applyRow < m; applyRow += blockDim.x)
-      {
-        int index = applyRow + threadIdx.x;
-        if(index < m)
+        if(index == vstart)
         {
-          Scalar val = Acol[index];
-          Scalar vIndex = 0;
-          if(index == col)
-            vIndex = 1;
-          else
-            vIndex = panel[col * m + index];
-          for(int i = vstart; i < m; i++)
-          {
-            Scalar vi = 0;
-            if(i == col)
-              vi = 1;
-            else
-              vi = panel[col * m + i];
-            val -= thisTau * vIndex * vi * Acol[i];
-          }
-          panel[applyCol * m + index] = val;
+          //thread 0 uniquely responsible for setting R diagonal entry and tau
+          tau[pc + col] = thisTau;
+          panel[col * PR + vstart] = -sign * norm;
+        }
+        else if(index < vend)
+        {
+          panel[col * PR + index] /= u;
         }
       }
-      __syncthreads();
+      __threadfence_block();
+      //v is now fully computed and stored back to panel
+      //compute z vector using W,Y
+      //each thread will compute one entry in z
+      for(int i = 0; i < PR; i += blockDim.x)
+      {
+        int index = i + threadIdx.x;
+        if(index < PR)
+        {
+          Scalar zval = 0;
+          //set zval to v[index]
+          if(index == vstart)
+            zval = -thisTau;
+          else if(index > vstart)
+            zval = -thisTau * panel[col * PR + index];
+          //finish computing entry i of z
+          //compute zval as (W * Y^T * v)(i)
+          Scalar wytvi = 0;
+          for(int j = vstart; j < vend; j++)
+          {
+            //need inner product of row i of W and row j of Y
+            //this is (WY^T)(i, j)
+            //use the fact that only the first col+1 columns of W and Y are nonzero
+            Scalar wyt = 0;
+            for(int k = 0; k < col; k++)
+            {
+              Scalar yval = 0;
+              int kColVstart = pc + k;
+              if(j > kColVstart)
+                yval = panel[k * PR + j];
+              else if(j == kColVstart)
+                yval = 1;
+              wyt += W[k * PR + index] * yval;
+            }
+            Scalar vval = 0;
+            if(j > vstart)
+              vval = panel[col * PR + j];
+            else if(j == vstart)
+              vval = 1;
+            wytvi += wyt * vval;
+          }
+          zval -= thisTau * wytvi;
+          W[col * PR + index] = zval;
+        }
+      }
+      __threadfence_block();
+      //apply reflector in col to remaining columns in panel
+      for(int applyCol = col + 1; applyCol < PC && pc + applyCol < n; applyCol++)
+      {
+        //Create a copy of the updating column of A which will
+        //persist while each entry is computed
+        //Only the height range [vstart, m) is read, used and written back
+        for(int i = vstart; i < P; i += blockDim.x)
+        {
+          int index = i + threadIdx.x;
+          if(index < PR)
+            Acol[index] = panel[applyCol * PR + index];
+        }
+        __syncthreads();
+        for(int applyRow = vstart; applyRow < PR; applyRow += blockDim.x)
+        {
+          int index = applyRow + threadIdx.x;
+          if(index < PR)
+          {
+            Scalar val = Acol[index];
+            Scalar vIndex = 0;
+            if(index == col)
+              vIndex = 1;
+            else
+              vIndex = panel[col * PR + index];
+            for(int i = vstart; i < PR; i++)
+            {
+              Scalar vi = 0;
+              if(i == col)
+                vi = 1;
+              else
+                vi = panel[col * PR + i];
+              val -= thisTau * vIndex * vi * Acol[i];
+            }
+            panel[applyCol * PR + index] = val;
+          }
+        }
+      }
     }
   }
 }
@@ -206,7 +228,7 @@ __global__ void panelHouseholderKernel(volatile Scalar* mat, Scalar* tau, volati
 //arrays declared volatile mean entries are not cached,
 //so that a threadfence_*() is sufficient to keep all values coherent
 //(meaning all writes before the fence are reflected in all reads after)
-__global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matScratch, Scalar* tau, volatile Scalar* W, int m, int n, int pc)
+__global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matScratch, Scalar* tau, volatile Scalar* W, int m, int n, int pr, int pc)
 {
   //All dynamic shared memory goes here
   //Is a flat 48 KiB buffer, free for use by each block
@@ -341,7 +363,8 @@ void identity(Scalar* A, int m)
 //All matrices are column-major
 void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
 {
-  //first, R is simpy the diagonal and upper triangular parts of A
+  puts("******\n\nCOMPUTING EXPLICIT QR REPRESENTATION*****\n\n");
+  //first, R is simply the upper triangular part of A (including diagonal)
   for(int i = 0; i < n; i++)
   {
     for(int j = 0; j < m; j++)
@@ -352,42 +375,101 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
         R[i * m + j] = 0;
     }
   }
-  //next, Q is the result of applying each Householder reflector to I(m)
+  //next, Q is the result of applying each Householder reflector
+  //(stored in subdiagonals) to I(m)
   //note: this is very expensive to do naively on host
   //first, get I(m) into Q
   identity(Q, m);
-  for(int i = 0; i < n; i++)
+  int rowPanels, colPanels;
+  getPanelDims(m, n, &rowPanels, &colPanels);
+  int pcCount = 0;
+  printf("Matrix is %d by %d panels.\n", rowPanels, colPanels);
+  for(int pc = 0; pc < n; pc += PC)
   {
-    Scalar* v = (Scalar*) malloc(m * sizeof(Scalar));
-    for(int j = 0; j < i; j++)
+    //then bottom to top, sliding panel up by R-C each iteration
+    //prCount gives row index of panel (bottom is 0)
+    int prCount = 0;
+    for(int pr = m - PR; (pr + PR > pc) && pr >= 0; pr -= (PR-PC))
     {
-      v[j] = 0;
-    }
-    v[i] = 1;
-    for(int j = i + 1; j < m; j++)
-    {
-      v[j] = A[i * m + j];
-    }
-    Scalar* H = (Scalar*) malloc(m * m * sizeof(Scalar));
-    identity(H, m);
-    //j is column of H being updated
-    for(int j = 0; j < m; j++)
-    {
-      //k is row
-      for(int k = 0; k < m; k++)
+      //is the panel at the bottom of A?
+      bool bottomPanel = pr == m - PR;
+      //does col 0 of panel cross A's diagonal?
+      bool topPanel = pr <= pc;
+      for(int col = 0; col < PC && col + pc < n; col++)
       {
-        H[k + j * m] -= tau[i] * v[k] * v[j];
+        printf("Applying reflector: col %d of panel %d, %d\n", col, pr, pc);
+        Scalar tauVal = tau[(rowPanels * pcCount + prCount) * PC + col];
+        printf("Tau for this column: %f\n", tauVal);
+        //update each trailing column (pr:pr+R, pc+C:N):
+        //for each column, compute HH reflectors
+        //(middle panels are both top and bottom)
+        int vstart;
+        int vend;
+        if(topPanel && bottomPanel)
+        {
+          vstart = pc - pr + col;
+          vend = PR;
+        }
+        else if(!topPanel && bottomPanel)
+        {
+          vstart = col;
+          vend = PR;
+        }
+        else if(topPanel && !bottomPanel)
+        {
+          //vstart needs to be at or below A's diagonal, even if
+          //panel boundaries extends above it
+          vstart = pc - pr + col;
+          vend = PR - PC + col + 1;
+        }
+        else
+        {
+          //neither top nor bottom panel
+          vstart = col;
+          vend = PR - PC + col + 1;
+        }
+        Scalar* v = malloc(m * sizeof(Scalar));
+        //read v from subdiagonal of A
+        for(int i = 0; i < m; i++)
+        {
+          if(i < pr + vstart || i >= pr + vend)
+            v[i] = 0;
+          else if(i == pr + vstart)
+            v[i] = 1;
+          else
+            v[i] = A[(pc + col) * m + i];
+        }
+        /*
+        printf("v:\n");
+        for(int i = 0; i < m; i++)
+        {
+          printf("%f ", v[i]);
+        }
+        putchar('\n');
+        */
+        //create H matrix for this reflector
+        Scalar* H = malloc(m * m * sizeof(Scalar));
+        identity(H, m);
+        for(int j = 0; j < m; j++)
+        {
+          for(int k = 0; k < m; k++)
+          {
+            H[k + j * m] -= tauVal * v[k] * v[j];
+          }
+        }
+        //dgemm can't multiply Q by H in-place,
+        //so make a persistent copy of Q
+        Scalar* prevQ = malloc(m * m * sizeof(Scalar));
+        for(int j = 0; j < m * m; j++)
+          prevQ[j] = Q[j];
+        dgemm(prevQ, H, Q, m, m, m);
+        free(prevQ);
+        free(v);
+        free(H);
       }
+      prCount++;
     }
-    //dgemm can't multiply Q by H in-place,
-    //so make a persistent copy of Q
-    Scalar* prevQ = (Scalar*) malloc(m * m * sizeof(Scalar));
-    for(int j = 0; j < m * m; j++)
-      prevQ[j] = Q[j];
-    dgemm(prevQ, H, Q, m, m, m);
-    free(prevQ);
-    free(H);
-    free(v);
+    pcCount++;
   }
 }
 
@@ -529,12 +611,14 @@ int main()
     puts("Only float (32-bit) and double (64-bit) reals are supported scalar types");
     exit(1);
   }
-  int m = 32;
-  int n = 32;
+  int m = PR + (PR - PC);
+  int n = PC * 2;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
-  Scalar* tau = (Scalar*) malloc(n * sizeof(Scalar));
+  int rowPanels, colPanels;
+  getPanelDims(m, n, &rowPanels, &colPanels);
+  Scalar* tau = malloc(rowPanels * n * sizeof(Scalar));
   srand(12);
   //initialize A randomly
   for(int i = 0; i < m * n; i++)
@@ -550,7 +634,7 @@ int main()
   gettimeofday(&currentTime, NULL);
   for(int i = 0; i < trials; i++)
   {
-    mmqr(RV, tau, m, n);
+    mmqr(RV, &tau, m, n);
     struct timeval nextTime;
     gettimeofday(&nextTime, NULL);
     //add to elapsed time
@@ -561,22 +645,30 @@ int main()
       memcpy(RV, A, m * n * sizeof(Scalar));
   }
   printf("Ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, elapsed / trials, trials);
+  printf("tau values after QR (grid corresponding to columns within panels):\n");
+  for(int j = 0; j < rowPanels; j++)
+  {
+    for(int i = 0; i < colPanels * PC; i++)
+    {
+      printf("%9f ", tau[i * rowPanels + j]);
+    }
+    putchar('\n');
+  }
+  putchar('\n');
   //printf("A raw storage after QR:\n");
   //printMat(RV, m, n);
-  /*
   Scalar* Q = (Scalar*) malloc(m * m * sizeof(Scalar));
   Scalar* R = (Scalar*) malloc(m * n * sizeof(Scalar));
   explicitQR(RV, tau, Q, R, m, n);
-  //printf("Q:\n");
-  //printMat(Q, m, m);
-  //printf("R:\n");
-  //printMat(R, m, n);
+  printf("Q:\n");
+  printMat(Q, m, m);
+  printf("R:\n");
+  printMat(R, m, n);
   //now compute Q*R explicitly and compare to A
   Scalar* QR = (Scalar*) malloc(m * n * sizeof(Scalar));
   dgemm(Q, R, QR, m, m, n);
   //printf("QR:\n");
   //printMat(QR, m, n);
-  //printf("QR-A (should be 0):\n");
   Scalar* QRmA = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar errNorm = 0;
   for(int i = 0; i < m * n; i++)
@@ -584,14 +676,14 @@ int main()
     QRmA[i] = QR[i] - A[i];
     errNorm += QRmA[i] * QRmA[i];
   }
-  //printMat(QRmA, m, n);
+  printf("QR-A (should be 0):\n");
+  printMat(QRmA, m, n);
   free(QRmA);
   errNorm = sqrt(errNorm);
   printf("L2 norm of residual QR-A: %.9g\n", errNorm);
   free(R);
   free(Q);
   free(QR);
-  */
   free(RV);
   free(A);
   return 0;
