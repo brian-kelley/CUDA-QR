@@ -11,9 +11,12 @@
 
 //PR is how big the square trailing update block matrix should be (per CUDA block)
 //(PR^2 + 2 * PR * PC) * sizeof(Scalar) should fit in 48 KiB
-#define PR 16
+#define PR 8
 //PC is how many columns of A get grouped into one compressed block Householder transform
-#define PC 16
+#define PC 2
+
+//integer division a/b, rounded up
+#define ceildiv(a, b) ((a) / (b) + ((a) % (b) != 0))
 
 void printMat(Scalar* mat, int m, int n);
 void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n);
@@ -46,7 +49,7 @@ void getPanelDims(int m, int n, int* rowPanels, int* colPanels)
 //Do block Householder factorization of the first PC columns of mat, starting at pc
 //this kernel is only meant to be run on a single block with as many threads as possible
 //this is because it contains many synchronization points
-__global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int m, int n, int pc, int rowPanels)
+__global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int m, int n, int pr, int pc)
 {
   //useful to think of shared memory buffer as a stack
   //for simple dynamic allocations
@@ -57,168 +60,214 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
   int finalReduceNum = 16;
   Scalar* panel = finalReduce + finalReduceNum;
   Scalar* Wshared = panel + (PR * PC);
-  Scalar* Acol = 
-  for(int pr = m - PR; (pr + PR > pc) && pr >= 0; pr -= (PR-PC))
+  Scalar* Acol = Wshared + (PR * PC);
+  //zero out shared W
+  for(int i = 0; i < PR * PC; i += blockDim.x)
   {
-    //zero out W
-    for(int i = 0; i < m * PC; i += blockDim.x)
+    int index = i + threadIdx.x;
+    if(index < m * PC)
+      Wshared[index] = 0;
+  }
+  //load panel into shared
+  for(int i = 0; i < PR * PC; i += blockDim.x)
+  {
+    if(i + threadIdx.x < PR * PC)
     {
-      int index = i + threadIdx.x;
-      if(index < m * PC)
-        W[index] = 0;
+      int col = i / PR;
+      int row = i % PR;
+      panel[row + col * PR] = mat[(pc + col) * m + pr + row];
     }
-    //load panel into shared
-    for(int i = 0; i < PR * PC; i += blockDim.x)
+  }
+  __syncthreads();
+  //this is a broadcast access, fast:
+  for(int col = 0; col < PC && pc + col < n; col++)
+  {
+    //is the panel at the bottom of A?
+    bool bottomPanel = pr == m - PR;
+    //does col 0 of panel cross A's diagonal?
+    bool topPanel = pr <= pc;
+    int vstart;
+    int vend;
+    if(topPanel && bottomPanel)
     {
-      if(i + threadIdx.x < PR * PC)
-      {
-        int col = i / PR;
-        int row = i % PR;
-        panel[row + col * PR] = mat[(pc + col) * m + pr + row];
-      }
+      vstart = pc - pr + col;
+      vend = PR;
     }
-    __syncthreads();
-    //this is a broadcast access, fast:
+    else if(!topPanel && bottomPanel)
+    {
+      vstart = col;
+      vend = PR;
+    }
+    else if(topPanel && !bottomPanel)
+    {
+      //vstart needs to be at or below A's diagonal, even if
+      //panel boundaries extends above it
+      vstart = pc - pr + col;
+      vend = PR - PC + col + 1;
+    }
+    else
+    {
+      //neither top nor bottom panel
+      vstart = col;
+      vend = PR - PC + col + 1;
+    }
     Scalar leading = panel[col * PR + vstart];
-    for(int col = 0; col < PC && pc + col < n; col++)
+    //note: when computing tau/reflectors,
+    //work directly with global mat (only 2 flops per element anyway)
+    //compute the inner product and norm of column
+    Scalar innerProd = 0;
     {
-      //note: when computing tau/reflectors,
-      //work directly with global mat (only 2 flops per element anyway)
-      //compute the inner product and norm of column
-      Scalar innerProd = 0;
+      Scalar localInnerProd = 0;
+      //use a cyclic row distribution for perfect coalesced accesses
+      for(int i = vstart; i < m; i += blockDim.x)
       {
-        Scalar localInnerProd = 0;
-        //use a cyclic row distribution for perfect coalesced accesses
-        for(int i = vstart; i < m; i += blockDim.x)
+        int index = i + threadIdx.x;
+        if(index < m)
+        {
+          localInnerProd += panel[index + col * m] * panel[index + col * m];
+        }
+      }
+      //now, sum up the localInnerProds across the whole block
+      //write the partial sums to shared, then do a simple linear reduction
+      toReduce[threadIdx.x] = localInnerProd;
+      __syncthreads();
+      if(threadIdx.x < finalReduceNum)
+      {
+        localInnerProd = 0;
+        for(int i = 0; i < blockDim.x; i += finalReduceNum)
         {
           int index = i + threadIdx.x;
-          if(index < m)
-          {
-            localInnerProd += panel[index + col * m] * panel[index + col * m];
-          }
+          if(index < blockDim.x)
+            localInnerProd += toReduce[index];
         }
-        //now, sum up the localInnerProds across the whole block
-        //write the partial sums to shared, then do a simple linear reduction
-        toReduce[threadIdx.x] = localInnerProd;
-        __threadfence();
-        if(threadIdx.x < finalReduceNum)
-        {
-          localInnerProd = 0;
-          for(int i = 0; i < blockDim.x; i += numFinal)
-          {
-            int index = i + threadIdx.x;
-            if(index < blockDim.x)
-              localInnerProd += toReduce[index];
-          }
-          finalReduce[threadIdx.x] = localInnerProd;
-        }
-        __threadfence();
-        //now, every thread sums up finalReduce to get innerProd
-        for(int i = 0; i < finalReduceNum; i++)
-          innerProd += finalReduce[i];
+        finalReduce[threadIdx.x] = localInnerProd;
       }
-      Scalar norm = sqrt(innerProd);
-      Scalar sign = (leading < 0) ? -1.0 : 1.0;
-      Scalar u = leading + sign * norm;
-      Scalar thisTau = sign * u / norm;
-      //compute entire w vector in-place, storing it back to A subdiag
+      __syncthreads();
+      //now, every thread sums up finalReduce to get innerProd
+      for(int i = 0; i < finalReduceNum; i++)
+        innerProd += finalReduce[i];
+    }
+    Scalar norm = sqrt(innerProd);
+    Scalar sign = (leading < 0) ? -1.0 : 1.0;
+    Scalar u = leading + sign * norm;
+    Scalar thisTau = sign * u / norm;
+    //compute entire w vector in-place, storing it back to A subdiag
+    for(int i = vstart; i < vend; i += blockDim.x)
+    {
+      int index = i + threadIdx.x;
+      if(index == vstart)
+      {
+        //thread 0 uniquely responsible for setting R diagonal entry and tau
+        tau[col] = thisTau;
+        panel[col * PR + vstart] = -sign * norm;
+      }
+      else if(index < vend)
+      {
+        panel[col * PR + index] /= u;
+      }
+    }
+    __threadfence_block();
+    //v is now fully computed and stored back to panel
+    //compute z vector using W,Y
+    //each thread will compute one entry in z
+    for(int i = 0; i < PR; i += blockDim.x)
+    {
+      int index = i + threadIdx.x;
+      if(index < PR)
+      {
+        Scalar zval = 0;
+        //set zval to v[index]
+        if(index == vstart)
+          zval = -thisTau;
+        else if(index > vstart)
+          zval = -thisTau * panel[col * PR + index];
+        //finish computing entry i of z
+        //compute zval as (W * Y^T * v)(i)
+        Scalar wytvi = 0;
+        for(int j = vstart; j < vend; j++)
+        {
+          //need inner product of row i of W and row j of Y
+          //this is (WY^T)(i, j)
+          //use the fact that only the first col+1 columns of W and Y are nonzero
+          Scalar wyt = 0;
+          for(int k = 0; k < col; k++)
+          {
+            Scalar yval = 0;
+            int kColVstart = pc + k;
+            if(j > kColVstart)
+              yval = panel[k * PR + j];
+            else if(j == kColVstart)
+              yval = 1;
+            wyt += W[k * PR + index] * yval;
+          }
+          Scalar vval = 0;
+          if(j > vstart)
+            vval = panel[col * PR + j];
+          else if(j == vstart)
+            vval = 1;
+          wytvi += wyt * vval;
+        }
+        zval -= thisTau * wytvi;
+        W[col * PR + index] = zval;
+      }
+    }
+    __threadfence_block();
+    //apply reflector in col to remaining columns in panel
+    for(int applyCol = col + 1; applyCol < PC && pc + applyCol < n; applyCol++)
+    {
+      //Create a copy of the updating column of A which will
+      //persist while each entry is computed
+      //Only the height range [vstart, m) is read, used and written back
       for(int i = vstart; i < vend; i += blockDim.x)
       {
         int index = i + threadIdx.x;
-        if(index == vstart)
-        {
-          //thread 0 uniquely responsible for setting R diagonal entry and tau
-          tau[pc + col] = thisTau;
-          panel[col * PR + vstart] = -sign * norm;
-        }
-        else if(index < vend)
-        {
-          panel[col * PR + index] /= u;
-        }
+        if(index < vend)
+          Acol[index] = panel[applyCol * PR + index];
       }
-      __threadfence_block();
-      //v is now fully computed and stored back to panel
-      //compute z vector using W,Y
-      //each thread will compute one entry in z
-      for(int i = 0; i < PR; i += blockDim.x)
+      __syncthreads();
+      for(int applyRow = vstart; applyRow < PR; applyRow += blockDim.x)
       {
-        int index = i + threadIdx.x;
+        int index = applyRow + threadIdx.x;
         if(index < PR)
         {
-          Scalar zval = 0;
-          //set zval to v[index]
-          if(index == vstart)
-            zval = -thisTau;
-          else if(index > vstart)
-            zval = -thisTau * panel[col * PR + index];
-          //finish computing entry i of z
-          //compute zval as (W * Y^T * v)(i)
-          Scalar wytvi = 0;
-          for(int j = vstart; j < vend; j++)
+          Scalar val = Acol[index];
+          Scalar vIndex = 0;
+          if(index == col)
+            vIndex = 1;
+          else
+            vIndex = panel[col * PR + index];
+          for(int i = vstart; i < vend; i++)
           {
-            //need inner product of row i of W and row j of Y
-            //this is (WY^T)(i, j)
-            //use the fact that only the first col+1 columns of W and Y are nonzero
-            Scalar wyt = 0;
-            for(int k = 0; k < col; k++)
-            {
-              Scalar yval = 0;
-              int kColVstart = pc + k;
-              if(j > kColVstart)
-                yval = panel[k * PR + j];
-              else if(j == kColVstart)
-                yval = 1;
-              wyt += W[k * PR + index] * yval;
-            }
-            Scalar vval = 0;
-            if(j > vstart)
-              vval = panel[col * PR + j];
-            else if(j == vstart)
-              vval = 1;
-            wytvi += wyt * vval;
-          }
-          zval -= thisTau * wytvi;
-          W[col * PR + index] = zval;
-        }
-      }
-      __threadfence_block();
-      //apply reflector in col to remaining columns in panel
-      for(int applyCol = col + 1; applyCol < PC && pc + applyCol < n; applyCol++)
-      {
-        //Create a copy of the updating column of A which will
-        //persist while each entry is computed
-        //Only the height range [vstart, m) is read, used and written back
-        for(int i = vstart; i < P; i += blockDim.x)
-        {
-          int index = i + threadIdx.x;
-          if(index < PR)
-            Acol[index] = panel[applyCol * PR + index];
-        }
-        __syncthreads();
-        for(int applyRow = vstart; applyRow < PR; applyRow += blockDim.x)
-        {
-          int index = applyRow + threadIdx.x;
-          if(index < PR)
-          {
-            Scalar val = Acol[index];
-            Scalar vIndex = 0;
-            if(index == col)
-              vIndex = 1;
+            Scalar vi = 0;
+            if(i == col)
+              vi = 1;
             else
-              vIndex = panel[col * PR + index];
-            for(int i = vstart; i < PR; i++)
-            {
-              Scalar vi = 0;
-              if(i == col)
-                vi = 1;
-              else
-                vi = panel[col * PR + i];
-              val -= thisTau * vIndex * vi * Acol[i];
-            }
-            panel[applyCol * PR + index] = val;
+              vi = panel[col * PR + i];
+            val -= thisTau * vIndex * vi * Acol[i];
           }
+          panel[applyCol * PR + index] = val;
         }
       }
+    }
+  }
+  __syncthreads();
+  //write out W and panel back to global
+  for(int i = 0; i < PR * PC; i += blockDim.x)
+  {
+    int index = i + threadIdx.x;
+    if(index < PR * PC)
+    {
+      W[index] = Wshared[index];
+    }
+  }
+  for(int i = 0; i < PR * PC; i += blockDim.x)
+  {
+    int index = i + threadIdx.x;
+    if(index < PR * PC)
+    {
+      int row = index % PR;
+      int col = index / PR;
+      mat[pr + row + (pc + col) * m] = panel[row + col * PR];
     }
   }
 }
@@ -228,7 +277,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
 //arrays declared volatile mean entries are not cached,
 //so that a threadfence_*() is sufficient to keep all values coherent
 //(meaning all writes before the fence are reflected in all reads after)
-__global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matScratch, Scalar* tau, volatile Scalar* W, int m, int n, int pr, int pc)
+__global__ void trailingUpdateKernel(Scalar* mat, Scalar* matScratch, Scalar* W, int m, int n, int pr, int pc)
 {
   //All dynamic shared memory goes here
   //Is a flat 48 KiB buffer, free for use by each block
@@ -346,6 +395,100 @@ __global__ void trailingUpdateKernel(volatile Scalar* mat, volatile Scalar* matS
   }
 }
 
+#define HANDLE_ERROR(x) \
+{\
+  cudaError_t err = x; \
+  if(x) {printf("CUDA error on line %i: %d\n", __LINE__, x); exit(1);} \
+}
+
+//Host wrapper for the main CUDA kernel
+//No extra overhead since copies to/from device would be necessary anyway
+void mmqr(Scalar* mat, Scalar* tau, int m, int n)
+{
+  int rowPanels, colPanels;
+  getPanelDims(m, n, &rowPanels, &colPanels);
+  Scalar* Adev;
+  HANDLE_ERROR(cudaMalloc((void**) &Adev, m * n * sizeof(Scalar)));
+  Scalar* tauDev;
+  HANDLE_ERROR(cudaMalloc((void**) &tauDev, rowPanels * n * sizeof(Scalar)));
+  HANDLE_ERROR(cudaMemcpy(Adev, mat, m * n * sizeof(Scalar), cudaMemcpyHostToDevice));
+  //launch the kernel
+  //
+  //only use one block and fixed threads for main kernel,
+  //but main kernel will itself launch several blocks to saturate FLOPs during trailing updates)
+  //
+  //want to use every SM in order to use all shared memory in device
+  //figure out how many SMs there are
+  cudaDeviceProp prop;
+  HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
+  int shmem = prop.sharedMemPerBlock;
+  int maxThreads = prop.maxThreadsPerBlock;
+  int factorThreads = 256;
+  //MUST have at least 48 KiB of shared memory for this to work in its current state
+  //TODO: adapt to any amount of shared
+  if(prop.sharedMemPerBlock < 48 * 1024)
+  {
+    puts("CUDA device has < 48 KiB shared memory per block!");
+    exit(1);
+  }
+  //want one block per SM and as many threads as possible (up to 1 per row of A)
+  Scalar* W;
+  Scalar* matScratch;
+  cudaMalloc((void**) &W, m * PC * sizeof(Scalar));
+  cudaMalloc((void**) &matScratch, m * n * sizeof(Scalar));
+  int pcCount = 0;
+  for(int pc = 0; pc < n; pc += PC)
+  {
+    int prCount = 0;
+    for(int pr = m - PR; (pr + PR > pc) && pr >= 0; pr -= (PR-PC))
+    {
+      //know exactly how much shared memory each kernel needs (at runtime)
+      int kernel1shared = (factorThreads + 16 + 2 * PR * PC + PR) * sizeof(Scalar);
+      assert(kernel1shared <= shmem);
+      printf("Kernel 1 (panel factor) needs %d bytes shared\n", kernel1shared);
+      printf("Launching kernel 1...");
+      Scalar* panelTau = &tauDev[(rowPanels * pcCount + prCount) * PC];
+      panelHouseholderKernel<<<1, factorThreads, kernel1shared>>>(Adev, panelTau, W, m, n, pr, pc);
+      puts("done");
+      //Scalar* Whost = (Scalar*) malloc(PC * m * sizeof(Scalar));
+      //cudaMemcpy(Whost, W, m * PC * sizeof(Scalar), cudaMemcpyDeviceToHost);
+      //puts("W matrix:");
+      //printMat(Whost, m, PC);
+      //free(Whost);
+      int changedColumns = PC;
+      if(changedColumns + pc > n)
+        changedColumns = n - pc;
+      //now, only need to update matScratch with the entries that have changed
+      //cudaMemcpy(matScratch + m * pc, Adev + m * pc, m * changedColumns * sizeof(Scalar), cudaMemcpyDeviceToDevice);
+      cudaMemcpy(matScratch, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToDevice);
+      if(pc + PC < n)
+      {
+        int blocksX = ceildiv(m - pc - PC, PR);
+        int blocksY = ceildiv(n - pc, PR);
+        dim3 gridSize(blocksX, blocksY);
+        printf("Launching block update kernel with %dx%d grid, updating %dx%d region\n", gridSize.x, gridSize.y, m - pc, n - pc - PC);
+        int kernel2shared = 2 * PR * PC + PR * PR;
+        assert(kernel2shared <= shmem);
+        printf("Kernel 2 (trailing update) needs %d bytes shared\n", kernel2shared);
+        printf("Launching kernel 2...");
+        trailingUpdateKernel<<<gridSize, maxThreads, kernel2shared>>>(Adev, matScratch, W, m, n, pr, pc);
+        puts("done");
+        //copy trailing columns of matScratch (just updated) back to Adev
+        cudaMemcpy(Adev + m * (pc + PC), matScratch + m * (pc + PC), m * (n - pc - PC) * sizeof(Scalar), cudaMemcpyDeviceToDevice);
+      }
+      prCount++;
+    }
+    pcCount++;
+  }
+  cudaFree(matScratch);
+  cudaFree(W);
+  //retrieve A and tau
+  HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
+  HANDLE_ERROR(cudaMemcpy(tau, tauDev, rowPanels * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
+  cudaFree(tauDev);
+  cudaFree(Adev);
+}
+
 //A = mxm identity matrix
 void identity(Scalar* A, int m)
 {
@@ -428,7 +571,7 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
           vstart = col;
           vend = PR - PC + col + 1;
         }
-        Scalar* v = malloc(m * sizeof(Scalar));
+        Scalar* v = (Scalar*) malloc(m * sizeof(Scalar));
         //read v from subdiagonal of A
         for(int i = 0; i < m; i++)
         {
@@ -439,16 +582,8 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
           else
             v[i] = A[(pc + col) * m + i];
         }
-        /*
-        printf("v:\n");
-        for(int i = 0; i < m; i++)
-        {
-          printf("%f ", v[i]);
-        }
-        putchar('\n');
-        */
         //create H matrix for this reflector
-        Scalar* H = malloc(m * m * sizeof(Scalar));
+        Scalar* H = (Scalar*) malloc(m * m * sizeof(Scalar));
         identity(H, m);
         for(int j = 0; j < m; j++)
         {
@@ -459,7 +594,7 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
         }
         //dgemm can't multiply Q by H in-place,
         //so make a persistent copy of Q
-        Scalar* prevQ = malloc(m * m * sizeof(Scalar));
+        Scalar* prevQ = (Scalar*) malloc(m * m * sizeof(Scalar));
         for(int j = 0; j < m * m; j++)
           prevQ[j] = Q[j];
         dgemm(prevQ, H, Q, m, m, m);
@@ -494,97 +629,6 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
   }
 }
 
-#define HANDLE_ERROR(x) \
-{\
-  cudaError_t err = x; \
-  if(x) {printf("CUDA error on line %i: %d\n", __LINE__, x); exit(1);} \
-}
-
-//Host wrapper for the main CUDA kernel
-//No extra overhead since copies to/from device would be necessary anyway
-void mmqr(Scalar* mat, Scalar* tau, int m, int n)
-{
-  Scalar* Adev;
-  HANDLE_ERROR(cudaMalloc((void**) &Adev, m * n * sizeof(Scalar)));
-  Scalar* tauDev;
-  HANDLE_ERROR(cudaMalloc((void**) &tauDev, n * sizeof(Scalar)));
-  HANDLE_ERROR(cudaMemcpy(Adev, mat, m * n * sizeof(Scalar), cudaMemcpyHostToDevice));
-  //launch the kernel
-  //
-  //only use one block and fixed threads for main kernel,
-  //but main kernel will itself launch several blocks to saturate FLOPs during trailing updates)
-  //
-  //want to use every SM in order to use all shared memory in device
-  //figure out how many SMs there are
-  cudaDeviceProp prop;
-  HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
-  int shmem = prop.sharedMemPerBlock;
-  int maxThreads = prop.maxThreadsPerBlock;
-  //MUST have at least 48 KiB of shared memory for this to work in its current state
-  //TODO: adapt to any amount of shared
-  if(prop.sharedMemPerBlock < 48 * 1024)
-  {
-    puts("CUDA device has < 48 KiB shared memory per block!");
-    exit(1);
-  }
-  //want one block per SM and as many threads as possible (up to 1 per row of A)
-  int threadsPerBlock = m < maxThreads ? m : maxThreads;
-  Scalar* W;
-  Scalar* matScratch;
-  Scalar* Acol;
-  cudaMalloc((void**) &W, m * PC * sizeof(Scalar));
-  cudaMalloc((void**) &Acol, m * sizeof(Scalar));
-  cudaMalloc((void**) &matScratch, m * n * sizeof(Scalar));
-  for(int pc = 0; pc < n; pc += PC)
-  {
-    //know exactly how much shared memory each kernel needs (at runtime)
-    int kernel1shared = (threadsPerBlock + 16) * sizeof(Scalar);
-    assert(kernel1shared <= shmem);
-    printf("Kernel 1 (panel factor) needs %d bytes shared\n", kernel1shared);
-    printf("Launching kernel 1...");
-    panelHouseholderKernel<<<1, threadsPerBlock, kernel1shared>>>(Adev, tauDev, W, Acol, m, n, pc);
-    puts("done");
-    //Scalar* Whost = (Scalar*) malloc(PC * m * sizeof(Scalar));
-    //cudaMemcpy(Whost, W, m * PC * sizeof(Scalar), cudaMemcpyDeviceToHost);
-    //puts("W matrix:");
-    //printMat(Whost, m, PC);
-    //free(Whost);
-    int changedColumns = PC;
-    if(changedColumns + pc > n)
-      changedColumns = n - pc;
-    //now, only need to update matScratch with the entries that have changed
-    //cudaMemcpy(matScratch + m * pc, Adev + m * pc, m * changedColumns * sizeof(Scalar), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(matScratch, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToDevice);
-    if(pc + PC < n)
-    {
-      int blocksX = (m - pc - PC) / PR;
-      if((m - pc - PC) % PR)
-        blocksX++;
-      int blocksY = (n - pc) / PR;
-      if((n - pc) % PR)
-        blocksY++;
-      dim3 gridSize(blocksX, blocksY);
-      printf("Launching block update kernel with %dx%d grid, updating %dx%d region\n", gridSize.x, gridSize.y, m - pc, n - pc - PC);
-      int kernel2shared = 2 * PR * PC + PR * PR;
-      assert(kernel2shared <= shmem);
-    printf("Kernel 2 (trailing update) needs %d bytes shared\n", kernel2shared);
-    printf("Launching kernel 2...");
-      trailingUpdateKernel<<<gridSize, maxThreads, kernel2shared>>>(Adev, matScratch, tau, W, m, n, pc);
-      puts("done");
-      //copy trailing columns of matScratch (just updated) back to Adev
-      cudaMemcpy(Adev + m * (pc + PC), matScratch + m * (pc + PC), m * (n - pc - PC) * sizeof(Scalar), cudaMemcpyDeviceToDevice);
-    }
-  }
-  cudaFree(matScratch);
-  cudaFree(Acol);
-  cudaFree(W);
-  //retrieve A and tau
-  HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
-  HANDLE_ERROR(cudaMemcpy(tau, tauDev, n * sizeof(Scalar), cudaMemcpyDeviceToHost));
-  cudaFree(tauDev);
-  cudaFree(Adev);
-}
-
 int main()
 {
   //only use one device (at least, for now)
@@ -611,14 +655,14 @@ int main()
     puts("Only float (32-bit) and double (64-bit) reals are supported scalar types");
     exit(1);
   }
-  int m = PR + (PR - PC);
-  int n = PC * 2;
+  int m = PR;
+  int n = PC;
   assert(m >= n);
   Scalar* A = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar* RV = (Scalar*) malloc(m * n * sizeof(Scalar));
   int rowPanels, colPanels;
   getPanelDims(m, n, &rowPanels, &colPanels);
-  Scalar* tau = malloc(rowPanels * n * sizeof(Scalar));
+  Scalar* tau = (Scalar*) malloc(rowPanels * n * sizeof(Scalar));
   srand(12);
   //initialize A randomly
   for(int i = 0; i < m * n; i++)
@@ -634,7 +678,7 @@ int main()
   gettimeofday(&currentTime, NULL);
   for(int i = 0; i < trials; i++)
   {
-    mmqr(RV, &tau, m, n);
+    mmqr(RV, tau, m, n);
     struct timeval nextTime;
     gettimeofday(&nextTime, NULL);
     //add to elapsed time

@@ -1,6 +1,6 @@
-all: host
+all: host device
 
-device:
+device: qr.cu
 	nvcc -arch=compute_35 -code=sm_35 -g -G -ccbin=icc qr.cu -o qr_device.exe
 
 host: qr.c
