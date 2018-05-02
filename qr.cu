@@ -61,25 +61,25 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
   Scalar* panel = finalReduce + finalReduceNum;
   Scalar* Wshared = panel + (PR * PC);
   Scalar* Acol = Wshared + (PR * PC);
-  //zero out shared W
+  //zero out Wshared
   for(int i = 0; i < PR * PC; i += blockDim.x)
   {
     int index = i + threadIdx.x;
-    if(index < m * PC)
+    if(index < PR * PC)
       Wshared[index] = 0;
   }
   //load panel into shared
   for(int i = 0; i < PR * PC; i += blockDim.x)
   {
-    if(i + threadIdx.x < PR * PC)
+    int index = i + threadIdx.x;
+    if(index < PR * PC)
     {
-      int col = i / PR;
-      int row = i % PR;
+      int col = index / PR;
+      int row = index % PR;
       panel[row + col * PR] = mat[(pc + col) * m + pr + row];
     }
   }
   __syncthreads();
-  //this is a broadcast access, fast:
   for(int col = 0; col < PC && pc + col < n; col++)
   {
     //is the panel at the bottom of A?
@@ -119,12 +119,12 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
     {
       Scalar localInnerProd = 0;
       //use a cyclic row distribution for perfect coalesced accesses
-      for(int i = vstart; i < m; i += blockDim.x)
+      for(int i = vstart; i < vend; i += blockDim.x)
       {
         int index = i + threadIdx.x;
-        if(index < m)
+        if(index < vend)
         {
-          localInnerProd += panel[index + col * m] * panel[index + col * m];
+          localInnerProd += panel[index + col * PR] * panel[index + col * PR];
         }
       }
       //now, sum up the localInnerProds across the whole block
@@ -208,7 +208,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
           wytvi += wyt * vval;
         }
         zval -= thisTau * wytvi;
-        W[col * PR + index] = zval;
+        Wshared[col * PR + index] = zval;
       }
     }
     __threadfence_block();
@@ -450,16 +450,10 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       Scalar* panelTau = &tauDev[(rowPanels * pcCount + prCount) * PC];
       panelHouseholderKernel<<<1, factorThreads, kernel1shared>>>(Adev, panelTau, W, m, n, pr, pc);
       puts("done");
-      //Scalar* Whost = (Scalar*) malloc(PC * m * sizeof(Scalar));
-      //cudaMemcpy(Whost, W, m * PC * sizeof(Scalar), cudaMemcpyDeviceToHost);
-      //puts("W matrix:");
-      //printMat(Whost, m, PC);
-      //free(Whost);
       int changedColumns = PC;
       if(changedColumns + pc > n)
         changedColumns = n - pc;
       //now, only need to update matScratch with the entries that have changed
-      //cudaMemcpy(matScratch + m * pc, Adev + m * pc, m * changedColumns * sizeof(Scalar), cudaMemcpyDeviceToDevice);
       cudaMemcpy(matScratch, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToDevice);
       if(pc + PC < n)
       {
