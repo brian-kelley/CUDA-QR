@@ -155,6 +155,10 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
     Scalar sign = (leading < 0) ? -1.0 : 1.0;
     Scalar u = leading + sign * norm;
     Scalar thisTau = sign * u / norm;
+    if(threadIdx.x == 0)
+    {
+      printf("This tau: %f\n", thisTau);
+    }
     //compute entire w vector in-place, storing it back to A subdiag
     for(int i = vstart; i < vend; i += blockDim.x)
     {
@@ -246,11 +250,13 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
       //Create a copy of the updating column of A which will
       //persist while each entry is computed
       //Only the height range [vstart, m) is read, used and written back
-      for(int i = vstart; i < vend; i += blockDim.x)
+      for(int i = 0; i < PR; i += blockDim.x)
       {
         int index = i + threadIdx.x;
-        if(index < vend)
+        if(index >= vstart && index < vend)
           Acol[index] = panel[applyCol * PR + index];
+        else if(index < PR)
+          Acol[index] = 0;
       }
       __syncthreads();
       for(int applyRow = vstart; applyRow < PR; applyRow += blockDim.x)
@@ -317,6 +323,10 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* matScratch, Scalar* W,
   Scalar* Wblock = &sharedBuf[0];
   Scalar* Yblock = &Wblock[PR * PC];
   Scalar* Ablock = &Yblock[PR * PC];
+  //is the panel at the bottom of A?
+  bool bottomPanel = pr == m - PR;
+  //does col 0 of panel cross A's diagonal?
+  bool topPanel = pr <= pc;
   //update trailing columns of A: A = (I + YW^T)A
   //Each block reads into Wblock/Yblock/Ablock, does multiplication and writes results out to Ascratch
   int blockRow = pr;
@@ -330,14 +340,39 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* matScratch, Scalar* W,
     {
       int row = index % PR;
       int col = index / PR;
-      int matRow = blockRow + row;
-      int matCol = blockCol + col;
+      int vstart;
+      int vend;
+      if(topPanel && bottomPanel)
+      {
+        vstart = pc - pr + col;
+        vend = PR;
+      }
+      else if(!topPanel && bottomPanel)
+      {
+        vstart = col;
+        vend = PR;
+      }
+      else if(topPanel && !bottomPanel)
+      {
+        //vstart needs to be at or below A's diagonal, even if
+        //panel boundaries extends above it
+        vstart = pc - pr + col;
+        vend = PR - PC + col + 1;
+      }
+      else
+      {
+        //neither top nor bottom panel
+        vstart = col;
+        vend = PR - PC + col + 1;
+      }
+      int matRow = pr + row;
+      int matCol = pc + col;
       //Y's columns are simply the reflectors stored in mat's subdiagonal.
       //this reads back the implicit 0/1 entries
       Scalar yval = 0;
-      if(matRow > matCol)
+      if(row > vstart && row < vend)
         yval = mat[matRow + m * matCol];
-      else if(matRow == matCol)
+      else if(row == vstart)
         yval = 1;
       Yblock[row + col * PR] = yval;
     }
@@ -424,13 +459,15 @@ __global__ void trailingCopyKernel(Scalar* Adev, Scalar* matScratch, int m, int 
 {
   int matRow = pr;
   int matCol = blockIdx.x * PR + (PC + pc);
+  if(threadIdx.x == 0)
+    printf("Block %d is copying entries starting at col %d.\n", blockIdx.x, matCol);
   for(int i = 0; i < PR * PR; i += blockDim.x)
   {
     int index = i + threadIdx.x;
     if(index < PR * PR)
     {
-      int row = i % PR;
-      int col = i / PR;
+      int row = index % PR;
+      int col = index / PR;
       if(matRow + row < m && matCol + col < n)
       {
         Adev[matRow + row + (matCol + col) * m] = matScratch[matRow + row + (matCol + col) * m];
@@ -496,8 +533,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       int changedColumns = PC;
       if(changedColumns + pc > n)
         changedColumns = n - pc;
-      //now, only need to update matScratch with the entries that have changed
-      cudaMemcpy(matScratch, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToDevice);
       if(pc + PC < n)
       {
         int blocks = ceildiv(n - pc - PC, PR);
@@ -547,7 +582,6 @@ void identity(Scalar* A, int m)
 //All matrices are column-major
 void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
 {
-  puts("******\n\nCOMPUTING EXPLICIT QR REPRESENTATION*****\n\n");
   //first, R is simply the upper triangular part of A (including diagonal)
   for(int i = 0; i < n; i++)
   {
@@ -567,7 +601,6 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
   int rowPanels, colPanels;
   getPanelDims(m, n, &rowPanels, &colPanels);
   int pcCount = 0;
-  printf("Matrix is %d by %d panels.\n", rowPanels, colPanels);
   for(int pc = 0; pc < n; pc += PC)
   {
     //then bottom to top, sliding panel up by R-C each iteration
@@ -581,9 +614,7 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
       bool topPanel = pr <= pc;
       for(int col = 0; col < PC && col + pc < n; col++)
       {
-        printf("Applying reflector: col %d of panel %d, %d\n", col, pr, pc);
         Scalar tauVal = tau[(rowPanels * pcCount + prCount) * PC + col];
-        printf("Tau for this column: %f\n", tauVal);
         //update each trailing column (pr:pr+R, pc+C:N):
         //for each column, compute HH reflectors
         //(middle panels are both top and bottom)
