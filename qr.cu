@@ -271,7 +271,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
         {
           Scalar val = Acol[index];
           Scalar vIndex = 0;
-          if(index == col)
+          if(index == vstart)
             vIndex = 1;
           else
             vIndex = panel[col * PR + index];
