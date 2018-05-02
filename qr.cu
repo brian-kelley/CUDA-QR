@@ -76,7 +76,10 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
     {
       int col = index / PR;
       int row = index % PR;
-      panel[row + col * PR] = mat[(pc + col) * m + pr + row];
+      if(pc + col < n)
+        panel[row + col * PR] = mat[(pc + col) * m + pr + row];
+      else
+        panel[row + col * PR] = 0;
     }
   }
   __syncthreads();
@@ -157,6 +160,8 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
     Scalar thisTau = sign * u / norm;
     if(threadIdx.x == 0)
     {
+      printf("Norm: %f\n", norm);
+      printf("Leading entry (entry %d, %d): %f\n", vstart, col, leading);
       printf("This tau: %f\n", thisTau);
     }
     //compute entire w vector in-place, storing it back to A subdiag
@@ -174,7 +179,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
         panel[col * PR + index] /= u;
       }
     }
-    __threadfence_block();
+    __syncthreads();
     //v is now fully computed and stored back to panel
     //compute z vector using W,Y
     //each thread will compute one entry in z
@@ -233,10 +238,10 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
             wyt += Wshared[k * PR + index] * yval;
           }
           Scalar vval = 0;
-          if(j > vstart && j < vend)
-            vval = panel[col * PR + j];
-          else if(j == vstart)
+          if(j == vstart)
             vval = 1;
+          else
+            vval = panel[col * PR + j];
           wytvi += wyt * vval;
         }
         zval -= thisTau * wytvi;
@@ -273,7 +278,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
           for(int i = vstart; i < vend; i++)
           {
             Scalar vi = 0;
-            if(i == col)
+            if(i == vstart)
               vi = 1;
             else
               vi = panel[col * PR + i];
@@ -551,6 +556,9 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         printf("Copying updated trail back to Adev...");
         trailingCopyKernel<<<blocks, maxThreads>>>(Adev, matScratch, m, n, pr, pc);
         puts("done");
+  HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
+        puts("Trailing matrix after update:\n");
+        printMat(&mat[PC * m], m, n / 2);
       }
       prCount++;
     }

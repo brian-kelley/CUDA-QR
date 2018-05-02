@@ -148,6 +148,9 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
         Scalar sign = (panel[col][vstart] < 0) ? -1.0 : 1.0;
         Scalar u = panel[col][vstart] + sign * norm;
         Scalar thisTau = sign * u / norm;
+        printf("\n\n\n\n\nNORM: %f\n", norm);
+        printf("Leading entry (%d, %d): %f\n", vstart, col, panel[col][vstart]);
+        printf("tau: %f\n", thisTau);
         panelTau[col] = thisTau;
         panel[col][vstart] = -sign * norm;
         Scalar* v = malloc(vlen * sizeof(Scalar));
@@ -282,6 +285,12 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
         }
         free(Acol);
         free(newAcol);
+      }
+      if(pc == 0)
+      {
+        puts("Trailing matrix after update:\n");
+        printMat(&mat[2 * m], m, 2);
+        putchar('\n');
       }
       for(int i = 0; i < PC; i++)
       {
