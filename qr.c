@@ -10,7 +10,7 @@
 //(2RC + C) * sizeof(Scalar) must fit in 48 KiB
 #define Scalar float
 #define PR 8
-#define PC 4
+#define PC 2
 
 void printMat(Scalar* mat, int m, int n);
 void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n);
@@ -238,6 +238,9 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
           mat[(row + pr) + (col + pc) * m] = panel[col][row];
         }
       }
+      puts("\nABOUT TO UPDATE TRAILING COLUMNS...\n");
+      puts("W matrix:");
+      printMat((Scalar*) W, PR, PC);
       //update trailing columns of A: A = (I + YW^T)A
       //all columns of A can be updated in parallel
       //so this loop can be a kernel launch with a few A columns in each block
@@ -445,7 +448,7 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 
 int main()
 {
-  int m = PR + (PR - PC);
+  int m = PR;
   int n = PC * 2;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
