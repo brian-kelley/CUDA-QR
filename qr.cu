@@ -7,7 +7,11 @@
 #include <sys/time.h>
 #include <cuda_profiler_api.h>
 
+//#define ENABLE_MAGMA
+
+#ifdef ENABLE_MAGMA
 #include "magma.h"
+#endif
 
 //Scalar type and panel width
 #define Scalar float
@@ -548,6 +552,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   cudaFree(Adev);
 }
 
+#ifdef ENABLE_MAGMA
 void magmaQR(Scalar* mat, Scalar* tau, int m, int n)
 {
   Scalar* Adev;
@@ -557,6 +562,7 @@ void magmaQR(Scalar* mat, Scalar* tau, int m, int n)
   magma_sgeqrf2_gpu(m, n, Adev, m, tau, &info);
   HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
 }
+#endif
 
 //A = mxm identity matrix
 void identity(Scalar* A, int m)
@@ -703,7 +709,9 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 int main(int argc, const char** argv)
 {
   HANDLE_ERROR(cudaSetDevice(0));
+#ifdef ENABLE_MAGMA
   magma_init();
+#endif
   if(argc < 3)
   {
     puts("Usage: ./qr_device m n");
@@ -778,6 +786,8 @@ int main(int argc, const char** argv)
     if(i != trials - 1)
       memcpy(RV, A, m * n * sizeof(Scalar));
   }
+  printf(" MMQR ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, mmqrElapsed / trials, trials);
+#ifdef ENABLE_MAGMA
   double magmaElapsed = 0;
   gettimeofday(&currentTime, NULL);
   for(int i = 0; i < trials; i++)
@@ -792,8 +802,8 @@ int main(int argc, const char** argv)
     if(i != trials - 1)
       memcpy(RV, A, m * n * sizeof(Scalar));
   }
-  printf(" MMQR ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, mmqrElapsed / trials, trials);
   printf("MAGMA ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, magmaElapsed / trials, trials);
+#endif
   cudaProfilerStop();
   /*
   printf("tau values after QR (grid corresponding to columns within panels):\n");
@@ -840,7 +850,9 @@ int main(int argc, const char** argv)
   */
   free(RV);
   free(A);
+#ifdef ENABLE_MAGMA
   magma_finalize();
+#endif
   return 0;
 }
 
