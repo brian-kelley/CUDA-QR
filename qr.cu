@@ -75,10 +75,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
     {
       int col = index / PR;
       int row = index % PR;
-      if(pc + col < n)
-        panel[row + col * PR] = mat[(pc + col) * m + pr + row];
-      else
-        panel[row + col * PR] = 0;
+      panel[row + col * PR] = mat[(pc + col) * m + pr + row];
     }
   }
   __syncthreads();
@@ -124,7 +121,6 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
     {
       printf("Vstart: %d Vend: %d\n", vstart, vend);
     }
-    Scalar leading = panel[col * PR + vstart];
     //note: when computing tau/reflectors,
     //work directly with global mat (only 2 flops per element anyway)
     //compute the inner product and norm of column
@@ -160,15 +156,17 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
       for(int i = 0; i < finalReduceNum; i++)
         innerProd += finalReduce[i];
     }
+    Scalar leading = panel[col * PR + vstart];
     Scalar norm = sqrt(innerProd);
     Scalar sign = (leading < 0) ? -1.0 : 1.0;
     Scalar u = leading + sign * norm;
     Scalar thisTau = sign * u / norm;
     if(threadIdx.x == 0)
     {
-      printf("Norm: %f\n", norm);
-      printf("Leading entry (entry %d, %d): %f\n", vstart, col, leading);
-      printf("This tau: %f\n", thisTau);
+      printf("BMK\n");
+      printf("Leading entry: %f\n", leading);
+      printf("norm: %f\n", norm);
+      printf("tau: %f\n", thisTau);
     }
     //compute entire w vector in-place, storing it back to A subdiag
     for(int i = vstart; i < vend; i += blockDim.x)
@@ -292,6 +290,44 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
         }
       }
     }
+    //DEBUGGING ONLY
+    for(int applyCol = PC; pc + applyCol < n; applyCol++)
+    {
+      //Create a copy of the updating column of A which will
+      //persist while each entry is computed
+      //Only the height range [vstart, m) is read, used and written back
+      for(int i = 0; i < vlen; i += blockDim.x)
+      {
+        int index = i + threadIdx.x;
+        if(index < vlen)
+          Acol[index] = mat[(pc + applyCol) * m + pr + vstart + index];
+      }
+      __syncthreads();
+      for(int applyRow = vstart; applyRow < vend; applyRow += blockDim.x)
+      {
+        int index = applyRow + threadIdx.x;
+        if(index < vend)
+        {
+          Scalar val = Acol[index - vstart];
+          Scalar vIndex = 0;
+          if(index == vstart)
+            vIndex = 1;
+          else
+            vIndex = panel[col * PR + index];
+          for(int i = vstart; i < vend; i++)
+          {
+            Scalar vi = 0;
+            if(i == vstart)
+              vi = 1;
+            else
+              vi = panel[col * PR + i];
+            val -= thisTau * vIndex * vi * Acol[i - vstart];
+          }
+          mat[(pc + applyCol * m) + pr + index] = val;
+        }
+      }
+      __syncthreads();
+    }
   }
   __syncthreads();
   //write out W and panel back to global
@@ -336,13 +372,22 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
   bool bottomPanel = pr == m - PR;
   //does col 0 of panel cross A's diagonal?
   bool topPanel = pr <= pc;
+  int minVstart = 0;
+  int maxVend = PR;
+  if(topPanel)
+  {
+    minVstart = pc - pr;
+  }
   //update trailing columns of A: A = (I + YW^T)A
   //Each block reads into Wblock/Yblock/Ablock, does multiplication and writes results out to Ascratch
   int blockCol = pc + PC + blockIdx.x * PR;
   if(threadIdx.x == 0)
   {
     printf("In trailing update kernel.\n");
-    printf("Responsible for updating panel %d, %d\n", pr, pc);
+    int maxCol = pc + PC + PR;
+    if(maxCol > n)
+      maxCol = n;
+    printf("Updating rows %d to %d, cols %d to %d.\n", pr + minVstart, pr + maxVend, pc + PC, maxCol);
   }
   //first load in Y block
   //it will stay constant for whole kernel
@@ -353,31 +398,10 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
     {
       int row = index % PR;
       int col = index / PR;
-      int vstart;
-      int vend;
-      if(topPanel && bottomPanel)
-      {
-        vstart = pc - pr + col;
-        vend = PR;
-      }
-      else if(!topPanel && bottomPanel)
-      {
-        vstart = col;
-        vend = PR;
-      }
-      else if(topPanel && !bottomPanel)
-      {
-        //vstart needs to be at or below A's diagonal, even if
-        //panel boundaries extends above it
-        vstart = pc - pr + col;
+      int vstart = minVstart + col;
+      int vend = maxVend;
+      if(!bottomPanel)
         vend = PR - PC + col + 1;
-      }
-      else
-      {
-        //neither top nor bottom panel
-        vstart = col;
-        vend = PR - PC + col + 1;
-      }
       int matRow = pr + row;
       int matCol = pc + col;
       //Y's columns are simply the reflectors stored in mat's subdiagonal.
@@ -407,17 +431,19 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
     for(int j = 0; j < PR; j += blockDim.x)
     {
       int index = j + threadIdx.x;
-      if(index < PR)
+      Scalar Acolval = 0;
+      if(index >= minVstart && index < maxVend)
       {
-        Acol[j] = mat[pr + index + (blockCol + applyCol) * m];
+        Acolval = mat[pr + index + (blockCol + applyCol) * m];
       }
+      Acol[j] = Acolval;
     }
     __syncthreads();
     //Compute the updated (I + Y * W^T) * Acol
     for(int i = 0; i < PR; i += blockDim.x)
     {
       int entry = i + threadIdx.x;
-      if(entry < PR)
+      if(entry >= minVstart && entry < maxVend)
       {
         //"entry" is the index of entry of new Acol being computed
         Scalar val = Acol[entry];
@@ -426,7 +452,7 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
           Scalar ywt = 0;
           for(int k = 0; k < PC; k++)
           {
-            ywt += Y[i + k * m] * Wshared[j + k * m];
+            ywt += Y[entry + k * m] * Wshared[j + k * m];
           }
           val += ywt * Acol[j];
         }
@@ -494,6 +520,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       printMat(mat, m, n);
 
       puts("done");
+      /*
       int changedColumns = PC;
       if(changedColumns + pc > n)
         changedColumns = n - pc;
@@ -516,6 +543,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         printf("After trailing update, full matrix:\n");
         printMat(mat, m, n);
       }
+      */
       prCount++;
     }
     pcCount++;

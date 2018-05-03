@@ -150,8 +150,9 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
         Scalar sign = (panel[col][vstart] < 0) ? -1.0 : 1.0;
         Scalar u = panel[col][vstart] + sign * norm;
         Scalar thisTau = sign * u / norm;
-        printf("\n\n\n\n\nNORM: %f\n", norm);
-        printf("Leading entry (%d, %d): %f\n", vstart, col, panel[col][vstart]);
+        printf("BMK\n");
+        printf("Leading entry: %f\n", panel[col][vstart]);
+        printf("norm: %f\n", norm);
         printf("tau: %f\n", thisTau);
         panelTau[col] = thisTau;
         panel[col][vstart] = -sign * norm;
