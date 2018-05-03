@@ -11,20 +11,19 @@
 
 //PR is how big the square trailing update block matrix should be (per CUDA block)
 //(PR^2 + 2 * PR * PC) * sizeof(Scalar) should fit in 48 KiB
-#define PR 8
+#define PR 4
 //PC is how many columns of A get grouped into one compressed block Householder transform
 #define PC 2
 
 //integer division a/b, rounded up
 #define ceildiv(a, b) ((a) / (b) + ((a) % (b) != 0))
 
-void printMat(Scalar* mat, int m, int n);
 void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n);
 void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n);
 void identity(Scalar* A, int m);
 
 //print a column-major matrix row-by-row (for debugging)
-void printMat(Scalar* mat, int m, int n)
+__host__ __device__ void printMat(Scalar* mat, int m, int n)
 {
   printf("Matrix %d x %d, row by row:\n", m, n);
   for(int i = 0; i < m; i++)
@@ -33,9 +32,9 @@ void printMat(Scalar* mat, int m, int n)
     {
       printf("%9f ", mat[j * m + i]);
     }
-    putchar('\n');
+    printf("\n");
   }
-  putchar('\n');
+  printf("\n");
 }
 
 void getPanelDims(int m, int n, int* rowPanels, int* colPanels)
@@ -83,6 +82,12 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
     }
   }
   __syncthreads();
+  if(threadIdx.x == 0)
+  {
+    printf("PANEL LOCATION: %d, %d\n", pr, pc);
+    printf("PANEL BEFORE FACTORIZATION\n");
+    printMat(panel, PR, PC);
+  }
   for(int col = 0; col < PC && pc + col < n; col++)
   {
     //is the panel at the bottom of A?
@@ -114,6 +119,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
       vstart = col;
       vend = PR - PC + col + 1;
     }
+    int vlen = vend - vstart;
     if(threadIdx.x == 0)
     {
       printf("Vstart: %d Vend: %d\n", vstart, vend);
@@ -255,21 +261,19 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
       //Create a copy of the updating column of A which will
       //persist while each entry is computed
       //Only the height range [vstart, m) is read, used and written back
-      for(int i = 0; i < PR; i += blockDim.x)
+      for(int i = 0; i < vlen; i += blockDim.x)
       {
         int index = i + threadIdx.x;
-        if(index >= vstart && index < vend)
-          Acol[index] = panel[applyCol * PR + index];
-        else if(index < PR)
-          Acol[index] = 0;
+        if(index < vlen)
+          Acol[index] = panel[applyCol * PR + vstart + index];
       }
       __syncthreads();
-      for(int applyRow = vstart; applyRow < PR; applyRow += blockDim.x)
+      for(int applyRow = vstart; applyRow < vend; applyRow += blockDim.x)
       {
         int index = applyRow + threadIdx.x;
-        if(index < PR)
+        if(index < vend)
         {
-          Scalar val = Acol[index];
+          Scalar val = Acol[index - vstart];
           Scalar vIndex = 0;
           if(index == vstart)
             vIndex = 1;
@@ -282,7 +286,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
               vi = 1;
             else
               vi = panel[col * PR + i];
-            val -= thisTau * vIndex * vi * Acol[i];
+            val -= thisTau * vIndex * vi * Acol[i - vstart];
           }
           panel[applyCol * PR + index] = val;
         }
@@ -308,6 +312,11 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
       int col = index / PR;
       mat[pr + row + (pc + col) * m] = panel[row + col * PR];
     }
+  }
+  if(threadIdx.x == 0)
+  {
+    printf("PANEL AFTER FACTORIZATION\n");
+    printMat(panel, PR, PC);
   }
 }
 
@@ -534,6 +543,10 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       printf("Launching kernel 1...");
       Scalar* panelTau = &tauDev[(rowPanels * pcCount + prCount) * PC];
       panelHouseholderKernel<<<1, factorThreads, kernel1shared>>>(Adev, panelTau, W, m, n, pr, pc);
+      HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
+      printf("Full matrix after processing panel %d, %d:\n", pr, pc);
+      printMat(mat, m, n);
+
       puts("done");
       int changedColumns = PC;
       if(changedColumns + pc > n)
@@ -556,9 +569,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         printf("Copying updated trail back to Adev...");
         trailingCopyKernel<<<blocks, maxThreads>>>(Adev, matScratch, m, n, pr, pc);
         puts("done");
-  HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
-        puts("Trailing matrix after update:\n");
-        printMat(&mat[PC * m], m, n / 2);
       }
       prCount++;
     }
@@ -662,6 +672,12 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
           else
             v[i] = A[(pc + col) * m + i];
         }
+        printf("REFLECTOR: column %d in panel %d, %d:\n", col, pr, pc);
+        for(int i = 0; i < m; i++)
+        {
+          printf("%9f ", v[i]);
+        }
+        putchar('\n');
         //create H matrix for this reflector
         Scalar* H = (Scalar*) malloc(m * m * sizeof(Scalar));
         identity(H, m);
@@ -711,8 +727,8 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 
 int main()
 {
-  int m = PR;
-  int n = PC * 2;
+  int m = PR + (PR - PC);
+  int n = PC;
   assert(m >= n);
   //only use one device (at least, for now)
   HANDLE_ERROR(cudaSetDevice(0));
@@ -791,8 +807,8 @@ int main()
   //now compute Q*R explicitly and compare to A
   Scalar* QR = (Scalar*) malloc(m * n * sizeof(Scalar));
   dgemm(Q, R, QR, m, m, n);
-  //printf("QR:\n");
-  //printMat(QR, m, n);
+  printf("QR:\n");
+  printMat(QR, m, n);
   Scalar* QRmA = (Scalar*) malloc(m * n * sizeof(Scalar));
   Scalar errNorm = 0;
   for(int i = 0; i < m * n; i++)

@@ -9,7 +9,7 @@
 //Scalar may be either float or double
 //(2RC + C) * sizeof(Scalar) must fit in 48 KiB
 #define Scalar float
-#define PR 8
+#define PR 4
 #define PC 2
 
 void printMat(Scalar* mat, int m, int n);
@@ -72,7 +72,6 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
     int prCount = 0;
     for(int pr = m - PR; (pr + PR > pc) && pr >= 0; pr -= (PR-PC))
     {
-      printf("Processing panel at (%d, %d)\n", pr, pc);
       //load panel into shared memory, one column at a time
       //Note that panel is column major
       Scalar (*panel)[PR] = malloc(PC * PR * sizeof(Scalar));
@@ -86,6 +85,9 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
           panel[col][row] = mat[(row + pr) + (col + pc) * m];
         }
       }
+      printf("PANEL LOCATION: %d, %d\n", pr, pc);
+      printf("PANEL BEFORE FACTORIZATION:\n");
+      printMat(&panel[0][0], PR, PC);
       //see Kerr/Campbell/Richards paper for blocked Householder description
       //
       //The W matrix (for applying whole panel of HH reflectors at once)
@@ -232,6 +234,8 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
         }
         free(v);
       }
+      printf("PANEL AFTER FACTORIZATION:\n");
+      printMat(&panel[0][0], PR, PC);
       //panel, panelTau, W and Y are all fully computed
       //write back panel to A
       for(int col = 0; col < PC; col++)
@@ -400,14 +404,12 @@ void explicitQR(Scalar* A, Scalar* tau, Scalar* Q, Scalar* R, int m, int n)
           else
             v[i] = A[(pc + col) * m + i];
         }
-        /*
-        printf("v:\n");
+        printf("REFLECTOR: column %d in panel %d, %d:\n", col, pr, pc);
         for(int i = 0; i < m; i++)
         {
-          printf("%f ", v[i]);
+          printf("%9f ", v[i]);
         }
         putchar('\n');
-        */
         //create H matrix for this reflector
         Scalar* H = malloc(m * m * sizeof(Scalar));
         identity(H, m);
@@ -457,8 +459,8 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 
 int main()
 {
-  int m = PR;
-  int n = PC * 2;
+  int m = PR + (PR - PC);
+  int n = PC;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* RV = malloc(m * n * sizeof(Scalar));
