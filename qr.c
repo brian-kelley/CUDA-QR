@@ -292,8 +292,8 @@ void mmqr(Scalar* mat, Scalar** tau, int m, int n)
       }
       if(pc == 0)
       {
-        puts("Trailing matrix after update:\n");
-        printMat(&mat[2 * m], m, 2);
+        puts("Full matrix after update:\n");
+        printMat(mat, m, n);
         putchar('\n');
       }
       for(int i = 0; i < PC; i++)
@@ -460,7 +460,7 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 int main()
 {
   int m = PR + (PR - PC);
-  int n = PC;
+  int n = PC * 2;
   assert(m >= n);
   Scalar* A = malloc(m * n * sizeof(Scalar));
   Scalar* RV = malloc(m * n * sizeof(Scalar));
