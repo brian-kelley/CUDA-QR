@@ -374,23 +374,9 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
   bool bottomPanel = pr == m - PR;
   //does col 0 of panel cross A's diagonal?
   bool topPanel = pr <= pc;
-  int minVstart = 0;
-  int maxVend = PR;
-  if(topPanel)
-  {
-    minVstart = pc - pr;
-  }
   //update trailing columns of A: A = (I + YW^T)A
   //Each block reads into Wblock/Yblock/Ablock, does multiplication and writes results out to Ascratch
   int blockCol = pc + PC + blockIdx.x * PR;
-  if(threadIdx.x == 0)
-  {
-    printf("In trailing update kernel.\n");
-    int maxCol = pc + PC + PR;
-    if(maxCol > n)
-      maxCol = n;
-    printf("Updating rows %d to %d, cols %d to %d.\n", pr + minVstart, pr + maxVend, pc + PC, maxCol);
-  }
   //first load in Y block
   //it will stay constant for whole kernel
   for(int i = 0; i < PR * PC; i += blockDim.x)
@@ -400,8 +386,31 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
     {
       int row = index % PR;
       int col = index / PR;
-      int vstart = minVstart + col;
-      int vend = PR;
+      int vstart;
+      int vend;
+      if(topPanel && bottomPanel)
+      {
+        vstart = pc - pr + col;
+        vend = PR;
+      }
+      else if(!topPanel && bottomPanel)
+      {
+        vstart = col;
+        vend = PR;
+      }
+      else if(topPanel && !bottomPanel)
+      {
+        //vstart needs to be at or below A's diagonal, even if
+        //panel boundaries extends above it
+        vstart = pc - pr + col;
+        vend = PR - PC + col + 1;
+      }
+      else
+      {
+        //neither top nor bottom panel
+        vstart = col;
+        vend = PR - PC + col + 1;
+      }
       if(!bottomPanel)
         vend = PR - PC + col + 1;
       int matRow = pr + row;
@@ -416,11 +425,6 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
       Y[row + col * PR] = yval;
     }
   }
-  if(threadIdx.x == 0)
-  {
-    printf("Y matrix for updating trail of %d, %d\n", pr, pc);
-    printMat(Y, PR, PC);
-  }
   //load Wblock into shared (from the global W)
   for(int i = 0; i < PR * PC; i += blockDim.x)
   {
@@ -431,6 +435,14 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
     }
   }
   __syncthreads();
+  if(threadIdx.x == 0)
+  {
+    printf("Y matrix for updating trail of %d, %d\n", pr, pc);
+    printMat(Y, PR, PC);
+    printf("W matrix for updating trail:\n");
+    printMat(Wshared, PR, PC);
+  }
+  __syncthreads();
   //For each column to update...
   for(int applyCol = 0; applyCol < PR && applyCol + pc + PC < n; applyCol++)
   {
@@ -438,19 +450,15 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
     for(int j = 0; j < PR; j += blockDim.x)
     {
       int index = j + threadIdx.x;
-      Scalar Acolval = 0;
-      if(index >= minVstart && index < maxVend)
-      {
-        Acolval = mat[pr + index + (blockCol + applyCol) * m];
-      }
-      Acol[j] = Acolval;
+      if(index < PR)
+        Acol[index] = mat[pr + index + (blockCol + applyCol) * m];
     }
     __syncthreads();
     //Compute the updated (I + Y * W^T) * Acol
     for(int i = 0; i < PR; i += blockDim.x)
     {
       int entry = i + threadIdx.x;
-      if(entry >= minVstart && entry < maxVend)
+      if(entry < PR)
       {
         //"entry" is the index of entry of new Acol being computed
         Scalar val = Acol[entry];
@@ -459,7 +467,7 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
           Scalar ywt = 0;
           for(int k = 0; k < PC; k++)
           {
-            ywt += Y[entry + k * m] * Wshared[j + k * m];
+            ywt += Y[entry + k * PR] * Wshared[j + k * PR];
           }
           val += ywt * Acol[j];
         }
