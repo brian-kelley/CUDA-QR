@@ -5,15 +5,20 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <sys/time.h>
+#include <cuda_profiler_api.h>
+
+#include "magma.h"
 
 //Scalar type and panel width
 #define Scalar float
 
 //PR is how big the square trailing update block matrix should be (per CUDA block)
 //(PR^2 + 2 * PR * PC) * sizeof(Scalar) should fit in 48 KiB
-#define PR 256
+#define PR 64
 //PC is how many columns of A get grouped into one compressed block Householder transform
-#define PC 16
+#define PC 4
+//Trials for timing
+#define trials 3
 
 //integer division a/b, rounded up
 #define ceildiv(a, b) ((a) / (b) + ((a) % (b) != 0))
@@ -311,8 +316,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
     {
       int row = index % PR;
       int col = index / PR;
-      if(pr + row < m && pc + col < n)
-        mat[pr + row + (pc + col) * m] = panel[row + col * PR];
+      mat[pr + row + (pc + col) * m] = panel[row + col * PR];
     }
   }
   /*
@@ -471,7 +475,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   cudaDeviceProp prop;
   HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
   int shmem = prop.sharedMemPerBlock;
-  int maxThreads = prop.maxThreadsPerBlock;
   int factorThreads = 256;
   //int sm = prop.multiProcessorCount;
   //MUST have at least 48 KiB of shared memory for this to work in its current state
@@ -498,7 +501,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   for(int pc = 0; pc < n; pc += PC)
   {
     int prCount = 0;
-    for(int pr = m - PR; pr + PR > pc; pr -= (PR-PC))
+    for(int pr = m - PR; pr + PR > pc && pr >= 0; pr -= (PR-PC))
     {
       //know exactly how much shared memory each kernel needs (at runtime)
       int kernel1shared = (factorThreads + 16 + 2 * PR * PC + PR) * sizeof(Scalar);
@@ -509,8 +512,8 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       */
       Scalar* panelTau = &tauDev[(rowPanels * pcCount + prCount) * PC];
       panelHouseholderKernel<<<1, factorThreads, kernel1shared>>>(Adev, panelTau, W, m, n, pr, pc);
-      HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
       /*
+      HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
       printf("Full matrix after processing panel %d, %d:\n", pr, pc);
       printMat(mat, m, n);
       puts("done");
@@ -527,7 +530,7 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         printf("Kernel 2 (trailing update) needs %d bytes shared\n", kernel2shared);
         printf("Launching kernel 2...");
         */
-        trailingUpdateKernel<<<blocks, maxThreads, kernel2shared>>>(Adev, W, m, n, pr, pc);
+        trailingUpdateKernel<<<blocks, 512, kernel2shared>>>(Adev, W, m, n, pr, pc);
         //puts("done");
         //HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
         //printf("After trailing update, full matrix:\n");
@@ -543,6 +546,16 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
   cudaFree(W);
   cudaFree(tauDev);
   cudaFree(Adev);
+}
+
+void magmaQR(Scalar* mat, Scalar* tau, int m, int n)
+{
+  Scalar* Adev;
+  HANDLE_ERROR(cudaMalloc((void**) &Adev, m * n * sizeof(Scalar)));
+  HANDLE_ERROR(cudaMemcpy(Adev, mat, m * n * sizeof(Scalar), cudaMemcpyHostToDevice));
+  magma_int_t info;
+  magma_sgeqrf2_gpu(m, n, Adev, m, tau, &info);
+  HANDLE_ERROR(cudaMemcpy(mat, Adev, m * n * sizeof(Scalar), cudaMemcpyDeviceToHost));
 }
 
 //A = mxm identity matrix
@@ -689,6 +702,8 @@ void dgemm(Scalar* A, Scalar* B, Scalar* C, int k, int m, int n)
 
 int main(int argc, const char** argv)
 {
+  HANDLE_ERROR(cudaSetDevice(0));
+  magma_init();
   if(argc < 3)
   {
     puts("Usage: ./qr_device m n");
@@ -697,12 +712,21 @@ int main(int argc, const char** argv)
   int m = atoi(argv[1]);
   int n = atoi(argv[2]);
   //make m,n fit to panels
-  m += (PR - PC) - ((m - PR) % (PR - PC));
-  n += PC - (n % PC);
+  {
+    int numPanels = ((double) (m - PR) / (PR - PC) + 0.5);
+    m = PR + numPanels * (PR - PC);
+  }
+  {
+    int numPanels = ((double) n / PC + 0.5);
+    if(numPanels == 0)
+      numPanels = 1;
+    n = numPanels * PC;
+    while(n > m)
+      n -= PC;
+  }
   printf("Exact problem size: %dx%d\n", m, n);
   assert(m && n && m >= n);
   //only use one device (at least, for now)
-  HANDLE_ERROR(cudaSetDevice(0));
   //First, make sure device is using proper 48 KB of shared, 16 KB L1
   //during all calls to L1 kernel
   //Note that this is not the default
@@ -739,8 +763,7 @@ int main(int argc, const char** argv)
   }
   //puts("A matrix:\n");
   //printMat(A, m, n);
-  int trials = 3;
-  double elapsed = 0;
+  double mmqrElapsed = 0;
   struct timeval currentTime;
   gettimeofday(&currentTime, NULL);
   for(int i = 0; i < trials; i++)
@@ -749,13 +772,29 @@ int main(int argc, const char** argv)
     struct timeval nextTime;
     gettimeofday(&nextTime, NULL);
     //add to elapsed time
-    elapsed += (nextTime.tv_sec + 1e-6 * nextTime.tv_usec) - (currentTime.tv_sec + 1e-6 * currentTime.tv_usec);
+    mmqrElapsed += (nextTime.tv_sec + 1e-6 * nextTime.tv_usec) - (currentTime.tv_sec + 1e-6 * currentTime.tv_usec);
     currentTime = nextTime;
     //refresh RV for next trial (this isn't part of the algorithm and so isn't timed)
     if(i != trials - 1)
       memcpy(RV, A, m * n * sizeof(Scalar));
   }
-  printf("Ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, elapsed / trials, trials);
+  double magmaElapsed = 0;
+  gettimeofday(&currentTime, NULL);
+  for(int i = 0; i < trials; i++)
+  {
+    magmaQR(RV, tau, m, n);
+    struct timeval nextTime;
+    gettimeofday(&nextTime, NULL);
+    //add to elapsed time
+    magmaElapsed += (nextTime.tv_sec + 1e-6 * nextTime.tv_usec) - (currentTime.tv_sec + 1e-6 * currentTime.tv_usec);
+    currentTime = nextTime;
+    //refresh RV for next trial (this isn't part of the algorithm and so isn't timed)
+    if(i != trials - 1)
+      memcpy(RV, A, m * n * sizeof(Scalar));
+  }
+  printf(" MMQR ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, mmqrElapsed / trials, trials);
+  printf("MAGMA ran QR on %dx%d matrix in %f s (avg over %d)\n", m, n, magmaElapsed / trials, trials);
+  cudaProfilerStop();
   /*
   printf("tau values after QR (grid corresponding to columns within panels):\n");
   for(int j = 0; j < rowPanels; j++)
@@ -801,6 +840,7 @@ int main(int argc, const char** argv)
   */
   free(RV);
   free(A);
+  magma_finalize();
   return 0;
 }
 
