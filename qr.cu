@@ -219,7 +219,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
             }
             else if(!topPanel && bottomPanel)
             {
-              vstartK = col;
+              vstartK = k;
               vendK = PR;
             }
             else if(topPanel && !bottomPanel)
@@ -227,7 +227,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
               //vstart needs to be at or below A's diagonal, even if
               //panel boundaries extends above it
               vstartK = pc - pr + k;
-              vendK = PR - PC + k+ 1;
+              vendK = PR - PC + k + 1;
             }
             else
             {
@@ -290,6 +290,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
         }
       }
     }
+    /*
     //DEBUGGING ONLY
     for(int applyCol = PC; pc + applyCol < n; applyCol++)
     {
@@ -328,6 +329,7 @@ __global__ void panelHouseholderKernel(Scalar* mat, Scalar* tau, Scalar* W, int 
       }
       __syncthreads();
     }
+    */
   }
   __syncthreads();
   //write out W and panel back to global
@@ -399,7 +401,7 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
       int row = index % PR;
       int col = index / PR;
       int vstart = minVstart + col;
-      int vend = maxVend;
+      int vend = PR;
       if(!bottomPanel)
         vend = PR - PC + col + 1;
       int matRow = pr + row;
@@ -413,6 +415,11 @@ __global__ void trailingUpdateKernel(Scalar* mat, Scalar* W, int m, int n, int p
         yval = 1;
       Y[row + col * PR] = yval;
     }
+  }
+  if(threadIdx.x == 0)
+  {
+    printf("Y matrix for updating trail of %d, %d\n", pr, pc);
+    printMat(Y, PR, PC);
   }
   //load Wblock into shared (from the global W)
   for(int i = 0; i < PR * PC; i += blockDim.x)
@@ -520,7 +527,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
       printMat(mat, m, n);
 
       puts("done");
-      /*
       int changedColumns = PC;
       if(changedColumns + pc > n)
         changedColumns = n - pc;
@@ -543,7 +549,6 @@ void mmqr(Scalar* mat, Scalar* tau, int m, int n)
         printf("After trailing update, full matrix:\n");
         printMat(mat, m, n);
       }
-      */
       prCount++;
     }
     pcCount++;
